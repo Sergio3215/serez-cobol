@@ -1,16 +1,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // serez-cobol — a COBOL → Serez (.sz) source-to-source translator.
 //
-// v0.1 subset (free-format COBOL):
-//   IDENTIFICATION / DATA (WORKING-STORAGE) / PROCEDURE divisions
-//   PIC 9(n) → int · 9(n)V9(m) / S9..V.. → dec · X(n) → string
-//   DISPLAY · MOVE · COMPUTE [ROUNDED] · ADD..TO · SUBTRACT..FROM
-//   IF / ELSE / END-IF · PERFORM <paragraph> · STOP RUN · paragraphs
-//
-// Written in pure .sz — it depends only on the serez-code core (the exact `dec`
-// type makes COBOL fixed-point arithmetic faithful). No core changes.
+// Translates a free-format COBOL program into an equivalent .sz program that runs
+// on the serez-code interpreter. Depends only on the core (the exact `dec` type
+// makes COBOL fixed-point / ROUNDED arithmetic faithful). No core changes.
 //
 // Usage:  sz cobol.sz <input.cob>     # writes <input>.sz next to it
+//
+// Supported (v1.0 path):
+//   DATA: PIC 9/9V9/X, S, VALUE, ZERO/SPACE; level 88 condition names.
+//   PROCEDURE: DISPLAY, MOVE, COMPUTE [ROUNDED], ADD/SUBTRACT/MULTIPLY/DIVIDE
+//     ([GIVING] [ROUNDED]), INITIALIZE, ACCEPT, CONTINUE, STOP RUN (→ exit).
+//     IF/ELSE/END-IF, EVALUATE/WHEN/WHEN OTHER/END-EVALUATE,
+//     PERFORM <para> [<n> TIMES | UNTIL c | VARYING v FROM a BY b UNTIL c],
+//     inline PERFORM ... END-PERFORM, paragraphs.
+//   Conditions: = > < >= <=, GREATER/LESS/EQUAL [THAN/TO], AND/OR, 88-names.
 // ─────────────────────────────────────────────────────────────────────────────
 
 use permissions { File, Env }
@@ -25,9 +29,17 @@ fn bool isAlphaCh(string c) {
 fn string tkType(string t) { return t.substring(0, 1); }
 fn string tkVal(string t)  { return t.substring(2); }
 fn string tkUp(string t)   { return t.substring(2).toUpperCase(); }
+fn bool isWord(string t, string up) { return tkType(t) == "W" && tkUp(t) == up; }
+fn bool isDot(string t) { return tkType(t) == "O" && tkVal(t) == "."; }
 
 // COBOL identifiers use '-'; .sz identifiers can't, so map '-' → '_'.
 fn string szName(string cobName) { return cobName.replaceAll("-", "_"); }
+fn string indentOf(int depth) {
+    let s = "";
+    let i = 0;
+    while (i < depth) { s = s + "    "; i = i + 1; }
+    return s;
+}
 
 // ── 1. TOKENIZER ─────────────────────────────────────────────────────────────
 fn [string] tokenizeAll([string] lines) {
@@ -35,8 +47,7 @@ fn [string] tokenizeAll([string] lines) {
     for (let raw in lines) {
         let line = raw.replaceAll("\r", "");
         let trimmed = line.trim();
-        // Whole-line comment: free-format '*' or '*>' at start.
-        if (trimmed.startsWith("*")) { continue; }
+        if (trimmed.startsWith("*")) { continue; }   // whole-line comment
         let i = 0;
         let n = line.length();
         while (i < n) {
@@ -48,7 +59,7 @@ fn [string] tokenizeAll([string] lines) {
                 i = i + 1;
                 let s = "";
                 while (i < n && line[i] != q) { s = s + line[i]; i = i + 1; }
-                i = i + 1; // closing quote
+                i = i + 1;
                 toks.push("S:" + s);
             } else if (isDigitCh(c)) {
                 let num = "";
@@ -79,7 +90,7 @@ fn [string] tokenizeAll([string] lines) {
                 toks.push("O:" + c);
                 i = i + 1;
             } else {
-                i = i + 1; // skip commas, semicolons, unknown
+                i = i + 1;
             }
         }
     }
@@ -89,18 +100,11 @@ fn [string] tokenizeAll([string] lines) {
 // ── 2. PIC parsing ── returns "kind|scale" ── kind: int|dec|string ────────────
 fn string picInfo(string mask) {
     let m = mask.toUpperCase();
-    if (m.includes("X")) { return "string|0"; }
-    // count fractional digits after V
+    if (m.includes("X") || m.includes("A")) { return "string|0"; }
     let vi = m.indexOf("V");
-    if (vi >= 0) {
-        let frac = m.substring(vi + 1);
-        let scale = countNines(frac);
-        return "dec|" + scale;
-    }
+    if (vi >= 0) { return "dec|" + countNines(m.substring(vi + 1)); }
     return "int|0";
 }
-
-// Count the digit positions a PIC fragment denotes: "99" → 2, "9(4)" → 4.
 fn int countNines(string frag) {
     let f = frag.toUpperCase();
     let count = 0;
@@ -120,14 +124,16 @@ fn int countNines(string frag) {
     return count;
 }
 
-// ── 3. COLLECT WORKING-STORAGE VARIABLES ──────────────────────────────────────
-// Each entry: "NAME|kind|scale|initLiteral"
+// ── 3. COLLECT WORKING-STORAGE VARIABLES + 88 CONDITION NAMES ──────────────────
+// Variable entry:  "NAME|kind|scale|init"      (kind: int|dec|string)
+// 88-cond entry:   "NAME|cc|0|<sz-condition>"  (e.g. "WS_FLAG == \"Y\"")
 fn [string] collectVars([string] toks) {
     let vars = [];
     let n = toks.length();
-    // locate WORKING-STORAGE .. PROCEDURE
     let i = 0;
     let inWS = false;
+    let lastVarSz = "";
+    let lastVarKind = "";
     while (i < n) {
         let t = toks[i];
         if (tkType(t) == "W") {
@@ -137,65 +143,66 @@ fn [string] collectVars([string] toks) {
         }
         if (!inWS) { i = i + 1; continue; }
 
-        // a declaration starts with a level number: N:01, N:05, N:77 ...
-        if (tkType(t) == "N") {
-            // next token is the name (W)
-            if (i + 1 < n && tkType(toks[i + 1]) == "W") {
-                let name = tkVal(toks[i + 1]);
-                let kind = "string";
-                let scale = 0;
-                let init = "";
+        if (tkType(t) == "N" && i + 1 < n && tkType(toks[i + 1]) == "W") {
+            let level = tkVal(t);
+            let name = tkVal(toks[i + 1]);
+
+            if (level == "88") {
+                // 88 COND VALUE val.  → parent's value-equality condition
                 let j = i + 2;
-                // scan to end of declaration ('.')
-                let mask = "";
-                let inPic = false;
-                let valNext = false;
-                let initSet = false;
-                while (j < n) {
+                let val = "";
+                while (j < n && !isDot(toks[j])) {
                     let tj = toks[j];
-                    if (tkType(tj) == "O" && tkVal(tj) == ".") { j = j + 1; break; }
-                    if (tkType(tj) == "W" && (tkUp(tj) == "PIC" || tkUp(tj) == "PICTURE")) {
-                        inPic = true; j = j + 1; continue;
+                    if (isWord(tj, "VALUE") || isWord(tj, "VALUES")) { j = j + 1; continue; }
+                    if (isWord(tj, "IS")) { j = j + 1; continue; }
+                    if (tkType(tj) == "S") { val = "\"" + tkVal(tj) + "\""; }
+                    else if (tkType(tj) == "N" || tkType(tj) == "D") {
+                        if (lastVarKind == "dec") { val = tkVal(tj) + "m"; } else { val = tkVal(tj); }
                     }
-                    if (tkType(tj) == "W" && tkUp(tj) == "VALUE") {
-                        inPic = false; valNext = true; j = j + 1; continue;
-                    }
-                    if (valNext) {
-                        if (tkType(tj) == "S") { init = "\"" + tkVal(tj) + "\""; }
-                        else if (tkType(tj) == "D") { init = tkVal(tj); }
-                        else if (tkType(tj) == "N") { init = tkVal(tj); }
-                        else if (tkType(tj) == "W") {
-                            let vu = tkUp(tj);
-                            if (vu == "ZERO" || vu == "ZEROS" || vu == "ZEROES") { init = "0"; }
-                            else if (vu == "SPACE" || vu == "SPACES") { init = "\"\""; }
-                        }
-                        initSet = true;
-                        valNext = false;
-                        j = j + 1;
-                        continue;
-                    }
-                    if (inPic) { mask = mask + tkVal(tj); j = j + 1; continue; }
                     j = j + 1;
                 }
-                let info = picInfo(mask);
-                let parts = info.split("|");
-                kind = parts[0];
-                scale = parseInt(parts[1]);
-                // default init by kind when none given
-                if (!initSet) {
-                    if (kind == "string") { init = "\"\""; } else { init = "0"; }
-                }
-                vars.push(name + "|" + kind + "|" + scale + "|" + init);
+                vars.push(name + "|cc|0|" + lastVarSz + " == " + val);
                 i = j;
                 continue;
             }
+
+            // a normal data item
+            let j = i + 2;
+            let mask = "";
+            let init = "";
+            let inPic = false;
+            let valNext = false;
+            let initSet = false;
+            while (j < n && !isDot(toks[j])) {
+                let tj = toks[j];
+                if (isWord(tj, "PIC") || isWord(tj, "PICTURE")) { inPic = true; j = j + 1; continue; }
+                if (isWord(tj, "VALUE")) { inPic = false; valNext = true; j = j + 1; continue; }
+                if (valNext) {
+                    if (tkType(tj) == "S") { init = "\"" + tkVal(tj) + "\""; }
+                    else if (tkType(tj) == "D" || tkType(tj) == "N") { init = tkVal(tj); }
+                    else if (isWord(tj, "ZERO") || isWord(tj, "ZEROS") || isWord(tj, "ZEROES")) { init = "0"; }
+                    else if (isWord(tj, "SPACE") || isWord(tj, "SPACES")) { init = "\"\""; }
+                    initSet = true; valNext = false; j = j + 1; continue;
+                }
+                if (inPic) { mask = mask + tkVal(tj); j = j + 1; continue; }
+                j = j + 1;
+            }
+            let info = picInfo(mask).split("|");
+            let kind = info[0];
+            let scale = parseInt(info[1]);
+            if (!initSet) { if (kind == "string") { init = "\"\""; } else { init = "0"; } }
+            vars.push(name + "|" + kind + "|" + scale + "|" + init);
+            lastVarSz = szName(name);
+            lastVarKind = kind;
+            i = j;
+            continue;
         }
         i = i + 1;
     }
     return vars;
 }
 
-// ── variable lookups against the collected table ──────────────────────────────
+// ── lookups ───────────────────────────────────────────────────────────────────
 fn int varIndex([string] vars, string name) {
     let i = 0;
     while (i < vars.length()) {
@@ -204,12 +211,13 @@ fn int varIndex([string] vars, string name) {
     }
     return -1;
 }
-fn string varKind([string] vars, string name) {
+fn string varField([string] vars, string name, int field) {
     let idx = varIndex(vars, name);
     if (idx < 0) { return "?"; }
-    return vars[idx].split("|")[1];
+    return vars[idx].split("|")[field];
 }
-fn int varScale([string] vars, string name) {
+fn string varKind([string] vars, string name)  { return varField(vars, name, 1); }
+fn int    varScale([string] vars, string name) {
     let idx = varIndex(vars, name);
     if (idx < 0) { return 0; }
     return parseInt(vars[idx].split("|")[2]);
@@ -221,101 +229,151 @@ fn string emitVars([string] vars) {
     let i = 0;
     while (i < vars.length()) {
         let p = vars[i].split("|");
-        let name = szName(p[0]);
         let kind = p[1];
-        let scale = parseInt(p[2]);
-        let init = p[3];
-        let rhs = init;
-        if (kind == "dec") {
-            // make the literal exact and fix the scale
-            if (init == "0") { rhs = "0m"; } else { rhs = init + "m"; }
-            rhs = "(" + rhs + ").setScale(" + scale + ", \"down\")";
-        } else if (kind == "int") {
-            if (init == "") { rhs = "0"; }
+        if (kind != "cc") {
+            let name = szName(p[0]);
+            let scale = parseInt(p[2]);
+            let init = p[3];
+            let rhs = init;
+            if (kind == "dec") {
+                if (init == "0") { rhs = "0m"; } else { rhs = init + "m"; }
+                rhs = "(" + rhs + ").setScale(" + scale + ", \"down\")";
+            } else if (kind == "int") {
+                if (init == "") { rhs = "0"; }
+            }
+            s = s + "let " + name + " = " + rhs + ";\n";
         }
-        s = s + "let " + name + " = " + rhs + ";\n";
         i = i + 1;
     }
     return s + "\n";
 }
 
-// ── 5. EXPRESSION / OPERAND TRANSLATION ───────────────────────────────────────
-// Translate one operand token to .sz text (names, literals).
+// ── 5. OPERAND / EXPRESSION / CONDITION TRANSLATION ───────────────────────────
 fn string operand([string] vars, string t) {
     let ty = tkType(t);
     if (ty == "W") {
         let up = tkUp(t);
         if (up == "ZERO" || up == "ZEROS" || up == "ZEROES") { return "0"; }
         if (up == "SPACE" || up == "SPACES") { return "\"\""; }
-        return szName(tkVal(t));
+        let nm = tkVal(t);
+        if (varKind(vars, nm) == "cc") { return "(" + varField(vars, nm, 3) + ")"; }
+        return szName(nm);
     }
     if (ty == "S") { return "\"" + tkVal(t) + "\""; }
-    if (ty == "D") { return tkVal(t) + "m"; }   // decimal literal → exact dec
+    if (ty == "D") { return tkVal(t) + "m"; }
     if (ty == "N") { return tkVal(t); }
     if (ty == "O") {
         let v = tkVal(t);
         if (v == "=") { return "=="; }
-        return v; // + - * / ( ) > < >= <=
+        return v;
     }
     return "";
 }
 
-// Is this token a statement-starting keyword? (ends the previous clause)
+// One token inside a condition (word relationals, logicals, 88-names).
+fn string condToken([string] vars, string t) {
+    if (tkType(t) == "W") {
+        let u = tkUp(t);
+        if (u == "AND") { return "&&"; }
+        if (u == "OR")  { return "||"; }
+        if (u == "GREATER") { return ">"; }
+        if (u == "LESS") { return "<"; }
+        if (u == "EQUAL" || u == "EQUALS") { return "=="; }
+        if (u == "THAN" || u == "IS" || u == "TO") { return ""; }
+        if (u == "NOT") { return "!"; }
+    }
+    return operand(vars, t);
+}
+
+// Statement-starting / clause-boundary keywords.
 fn bool isStmtKw(string t) {
     if (tkType(t) != "W") { return false; }
     let u = tkUp(t);
     return u == "DISPLAY" || u == "MOVE" || u == "COMPUTE" || u == "ADD"
-        || u == "SUBTRACT" || u == "IF" || u == "ELSE" || u == "END-IF"
-        || u == "PERFORM" || u == "STOP" || u == "ACCEPT";
+        || u == "SUBTRACT" || u == "MULTIPLY" || u == "DIVIDE" || u == "IF"
+        || u == "ELSE" || u == "END-IF" || u == "PERFORM" || u == "STOP"
+        || u == "ACCEPT" || u == "EVALUATE" || u == "WHEN" || u == "END-EVALUATE"
+        || u == "END-PERFORM" || u == "CONTINUE" || u == "INITIALIZE"
+        || u == "GO" || u == "NEXT";
 }
 
-// Collect names targeted by PERFORM (they are subroutines, not main-flow). '|'-joined.
+// Build an expression from pos until a stmt keyword / '.' / optional stop word.
+fn [any] grabExpr([string] toks, int pos, [string] vars, string stopWord) {
+    let n = toks.length();
+    let j = pos;
+    let expr = "";
+    while (j < n) {
+        let tj = toks[j];
+        if (isDot(tj) || isStmtKw(tj)) { break; }
+        if (stopWord != "" && isWord(tj, stopWord)) { break; }
+        expr = expr + operand(vars, tj) + " ";
+        j = j + 1;
+    }
+    return [j, expr.trim()];
+}
+// Build a condition from pos until a stmt keyword / '.' / optional stop word.
+fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
+    let n = toks.length();
+    let j = pos;
+    let cond = "";
+    while (j < n) {
+        let tj = toks[j];
+        if (isDot(tj) || isStmtKw(tj)) { break; }
+        if (stopWord != "" && isWord(tj, stopWord)) { break; }
+        if (isWord(tj, "THEN")) { j = j + 1; continue; }
+        let piece = condToken(vars, tj);
+        if (piece != "") { cond = cond + piece + " "; }
+        j = j + 1;
+    }
+    return [j, cond.trim()];
+}
+
+// ── 6. PROCEDURE DIVISION ─────────────────────────────────────────────────────
 fn string collectPerformTargets([string] toks) {
     let targets = "";
     let n = toks.length();
     let i = 0;
     while (i < n) {
-        if (tkType(toks[i]) == "W" && tkUp(toks[i]) == "PERFORM" && i + 1 < n
-            && tkType(toks[i + 1]) == "W") {
-            targets = targets + szName(tkVal(toks[i + 1])) + "|";
+        if (isWord(toks[i], "PERFORM") && i + 1 < n && tkType(toks[i + 1]) == "W") {
+            let nx = tkUp(toks[i + 1]);
+            if (nx != "UNTIL" && nx != "VARYING") {
+                targets = targets + szName(tkVal(toks[i + 1])) + "|";
+            }
         }
         i = i + 1;
     }
     return targets;
 }
 
-// ── 6. EMIT PROCEDURE DIVISION ────────────────────────────────────────────────
-// Two passes: paragraphs become fn PARA_() {...}; loose code becomes main body.
 fn string emitProcedure([string] toks, [string] vars) {
     let n = toks.length();
-    // find start of PROCEDURE DIVISION (after its '.')
     let start = -1;
     let i = 0;
     while (i < n) {
-        if (tkType(toks[i]) == "W" && tkUp(toks[i]) == "PROCEDURE") { start = i; break; }
+        if (isWord(toks[i], "PROCEDURE")) { start = i; break; }
         i = i + 1;
     }
     if (start < 0) { return "// (no PROCEDURE DIVISION)\n"; }
-    // skip 'PROCEDURE DIVISION .'
     i = start + 1;
-    while (i < n && !(tkType(toks[i]) == "O" && tkVal(toks[i]) == ".")) { i = i + 1; }
-    i = i + 1; // past the '.'
+    while (i < n && !isDot(toks[i])) { i = i + 1; }
+    i = i + 1;
 
-    // Split the procedure body into paragraphs. paraNames[k] / paraBody[k] (sz text).
-    // Leading statements before the first label go into the "main" stream.
-    let funcs = "";       // emitted fn definitions
-    let mainCalls = "";   // emitted main body
-    let curName = "";     // current paragraph (or "" for main)
+    let funcs = "";
+    let mainCalls = "";
+    let curName = "";
     let curBody = "";
-    let indent = "    ";
-    let paraOrder = "";   // paragraph names in declaration order, '|'-joined
+    let paraOrder = "";
+    let closeStack = [];   // close-text per open block (for END-x and '.')
+    let evalSubj = [];     // parallel: EVALUATE subject ("" for non-eval blocks)
+    let evalSeen = [];     // parallel: "1" once a WHEN was emitted
 
     while (i < n) {
         let t = toks[i];
-        // paragraph label: a bare WORD immediately followed by '.'
-        if (tkType(t) == "W" && !isStmtKw(t) && i + 1 < n
-            && tkType(toks[i + 1]) == "O" && tkVal(toks[i + 1]) == ".") {
-            // flush current
+        let depth = closeStack.length();
+        let ind = indentOf(depth + 1);
+
+        // paragraph label: bare WORD + '.', only at sentence level (no open blocks)
+        if (depth == 0 && tkType(t) == "W" && !isStmtKw(t) && i + 1 < n && isDot(toks[i + 1])) {
             if (curName == "") { mainCalls = mainCalls + curBody; }
             else {
                 funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
@@ -326,34 +384,158 @@ fn string emitProcedure([string] toks, [string] vars) {
             i = i + 2;
             continue;
         }
-        // a statement → translate it; advance i past it
-        let r = emitStmt(toks, i, vars, indent);
-        let newi = r[0];
-        let code = r[1];
-        curBody = curBody + code;
-        if (newi <= i) { i = i + 1; } else { i = newi; }
+
+        // sentence terminator: close every open inline block
+        if (isDot(t)) {
+            while (closeStack.length() > 0) {
+                let ct = closeStack.pop();
+                evalSubj.pop();
+                evalSeen.pop();
+                curBody = curBody + ct;
+            }
+            i = i + 1;
+            continue;
+        }
+
+        let kw = "";
+        if (tkType(t) == "W") { kw = tkUp(t); }
+
+        if (kw == "IF") {
+            let r = grabCond(toks, i + 1, vars, "");
+            curBody = curBody + ind + "if (" + r[1] + ") \{\n";
+            closeStack.push(ind + "\}\n");
+            evalSubj.push("");
+            evalSeen.push("");
+            i = r[0];
+            continue;
+        }
+        if (kw == "ELSE") {
+            curBody = curBody + ind + "\} else \{\n";
+            i = i + 1;
+            continue;
+        }
+        if (kw == "END-IF" || kw == "END-PERFORM" || kw == "END-EVALUATE") {
+            if (closeStack.length() > 0) {
+                let ct = closeStack.pop();
+                evalSubj.pop();
+                evalSeen.pop();
+                curBody = curBody + ct;
+            }
+            i = i + 1;
+            continue;
+        }
+
+        if (kw == "EVALUATE") {
+            // subject: TRUE → conditions per WHEN; else value compared per WHEN
+            let subj = "";
+            if (isWord(toks[i + 1], "TRUE")) { subj = "TRUE"; i = i + 2; }
+            else { let r = grabExpr(toks, i + 1, vars, ""); subj = r[1]; i = r[0]; }
+            closeStack.push(ind + "\}\n");
+            evalSubj.push(subj);
+            evalSeen.push("");
+            continue;
+        }
+        if (kw == "WHEN") {
+            let top = closeStack.length() - 1;
+            let subj = evalSubj[top];
+            let seen = evalSeen[top];
+            let lead = "} else if";
+            if (seen == "") { lead = "if"; evalSeen[top] = "1"; }
+            if (isWord(toks[i + 1], "OTHER")) {
+                curBody = curBody + ind + "\} else \{\n";
+                i = i + 2;
+                continue;
+            }
+            if (subj == "TRUE") {
+                let r = grabCond(toks, i + 1, vars, "");
+                curBody = curBody + ind + lead + " (" + r[1] + ") \{\n";
+                i = r[0];
+            } else {
+                let r = grabExpr(toks, i + 1, vars, "");
+                curBody = curBody + ind + lead + " (" + subj + " == " + r[1] + ") \{\n";
+                i = r[0];
+            }
+            continue;
+        }
+
+        if (kw == "PERFORM") {
+            // inline forms (no paragraph name): UNTIL / VARYING / <n> TIMES … END-PERFORM
+            let nx = toks[i + 1];
+            if (isWord(nx, "UNTIL")) {
+                let r = grabCond(toks, i + 2, vars, "");
+                curBody = curBody + ind + "while (!(" + r[1] + ")) \{\n";
+                closeStack.push(ind + "\}\n"); evalSubj.push(""); evalSeen.push("");
+                i = r[0];
+                continue;
+            }
+            if (isWord(nx, "VARYING")) {
+                let res = emitVarying(toks, i + 2, vars, ind);
+                curBody = curBody + res[1];
+                closeStack.push(res[2]); evalSubj.push(""); evalSeen.push("");
+                i = res[0];
+                continue;
+            }
+            if (tkType(nx) == "N") {
+                // PERFORM <n> TIMES … END-PERFORM
+                let cnt = "__p" + i;
+                curBody = curBody + ind + "let " + cnt + " = 0;\n";
+                curBody = curBody + ind + "while (" + cnt + " < " + tkVal(nx) + ") \{\n";
+                closeStack.push(ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "\}\n");
+                evalSubj.push(""); evalSeen.push("");
+                i = i + 3; // n TIMES
+                continue;
+            }
+            // out-of-line PERFORM <para> [...]
+            let r = emitStmt(toks, i, vars, ind);
+            curBody = curBody + r[1];
+            if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
+            continue;
+        }
+
+        // leaf statement
+        let r = emitStmt(toks, i, vars, ind);
+        curBody = curBody + r[1];
+        if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
     }
-    // flush last
+
     if (curName == "") { mainCalls = mainCalls + curBody; }
     else {
         funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
         paraOrder = paraOrder + szName(curName) + "|";
     }
 
-    // COBOL falls through paragraphs top-to-bottom. PERFORM targets are
-    // subroutines, so the main flow only calls the non-PERFORMed paragraphs in
-    // order (the common "MAIN does PERFORMs then STOP RUN" pattern).
     let targets = collectPerformTargets(toks);
     let calls = "";
-    let names = paraOrder.split("|");
-    for (let nm in names) {
+    for (let nm in paraOrder.split("|")) {
         if (nm != "" && !targets.includes(nm + "|")) { calls = calls + nm + "_();\n"; }
     }
-
     return funcs + "// ── main ──\n" + mainCalls + calls;
 }
 
-// Translate the statement starting at `pos`. Returns ["newPos", "code"].
+// PERFORM VARYING v FROM a BY b UNTIL c  → loop header + close text.
+// Returns [newPos, header, closeText].
+fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
+    let n = toks.length();
+    let v = szName(tkVal(toks[pos]));
+    let j = pos + 1;
+    if (j < n && isWord(toks[j], "FROM")) { j = j + 1; }
+    let rf = grabExpr(toks, j, vars, "BY");
+    let from = rf[1];
+    j = rf[0];
+    if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+    let rb = grabExpr(toks, j, vars, "UNTIL");
+    let by = rb[1];
+    j = rb[0];
+    if (j < n && isWord(toks[j], "UNTIL")) { j = j + 1; }
+    let rc = grabCond(toks, j, vars, "");
+    let cond = rc[1];
+    j = rc[0];
+    let header = ind + v + " = " + from + ";\n" + ind + "while (!(" + cond + ")) \{\n";
+    let close = ind + "    " + v + " = " + v + " + " + by + ";\n" + ind + "\}\n";
+    return [j, header, close];
+}
+
+// ── 7. LEAF STATEMENTS ────────────────────────────────────────────────────────
 fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
     let n = toks.length();
     let t = toks[pos];
@@ -364,7 +546,7 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         let j = pos + 1;
         let parts = "";
         let first = true;
-        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
+        while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
             let piece = operand(vars, toks[j]);
             if (piece != "") {
                 if (first) { parts = piece; first = false; }
@@ -372,157 +554,179 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
             }
             j = j + 1;
         }
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
         if (parts == "") { parts = "\"\""; }
         return [j, ind + "out " + parts + ";\n"];
     }
 
     if (kw == "MOVE") {
-        // MOVE <src> TO <dst>
         let src = operand(vars, toks[pos + 1]);
         let j = pos + 2;
-        // skip TO
-        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "TO") { j = j + 1; }
+        if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
         let dstName = tkVal(toks[j]);
-        let dst = szName(dstName);
         j = j + 1;
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        let kind = varKind(vars, dstName);
-        let code = "";
-        if (kind == "dec") {
-            let sc = varScale(vars, dstName);
-            code = ind + dst + " = (" + decify(src) + ").setScale(" + sc + ", \"down\");\n";
-        } else {
-            code = ind + dst + " = " + src + ";\n";
-        }
-        return [j, code];
+        return [j, assign(vars, dstName, src, ind)];
     }
 
     if (kw == "COMPUTE") {
-        // COMPUTE <dst> = <expr> [ROUNDED]
         let dstName = tkVal(toks[pos + 1]);
-        let dst = szName(dstName);
         let j = pos + 2;
         if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == "=") { j = j + 1; }
         let expr = "";
         let rounded = false;
-        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
-            if (tkType(toks[j]) == "W" && tkUp(toks[j]) == "ROUNDED") { rounded = true; j = j + 1; continue; }
+        while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
+            if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
             expr = expr + operand(vars, toks[j]) + " ";
             j = j + 1;
         }
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        let kind = varKind(vars, dstName);
-        let code = "";
-        if (kind == "dec") {
-            let sc = varScale(vars, dstName);
-            let mode = "down";
-            if (rounded) { mode = "half-up"; }
-            code = ind + dst + " = (" + expr.trim() + ").setScale(" + sc + ", \"" + mode + "\");\n";
-        } else {
-            code = ind + dst + " = (" + expr.trim() + ");\n";
-        }
-        return [j, code];
+        return [j, assignExpr(vars, dstName, expr.trim(), rounded, ind)];
     }
 
-    if (kw == "ADD") {
-        // ADD <x> TO <dst>
-        let x = operand(vars, toks[pos + 1]);
+    if (kw == "ADD" || kw == "SUBTRACT" || kw == "MULTIPLY" || kw == "DIVIDE") {
+        return emitArith(toks, pos, vars, ind, kw);
+    }
+
+    if (kw == "INITIALIZE") {
+        let dstName = tkVal(toks[pos + 1]);
+        let k = varKind(vars, dstName);
+        let z = "0";
+        if (k == "dec") { z = "(0m).setScale(" + varScale(vars, dstName) + ", \"down\")"; }
+        else if (k == "string") { z = "\"\""; }
+        return [pos + 2, ind + szName(dstName) + " = " + z + ";\n"];
+    }
+
+    if (kw == "ACCEPT") {
+        // ACCEPT <var>  → read a line into the variable
+        let dstName = tkVal(toks[pos + 1]);
         let j = pos + 2;
-        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "TO") { j = j + 1; }
-        let dstName = tkVal(toks[j]);
-        let dst = szName(dstName);
-        j = j + 1;
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        return [j, applyArith(dst, dstName, dst + " + " + x, vars, ind)];
+        // ACCEPT x FROM DATE/TIME → DateTime (skip the FROM clause)
+        if (j < n && isWord(toks[j], "FROM")) { while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; } }
+        return [j, ind + szName(dstName) + " = input();\n"];
     }
 
-    if (kw == "SUBTRACT") {
-        // SUBTRACT <x> FROM <dst>
-        let x = operand(vars, toks[pos + 1]);
-        let j = pos + 2;
-        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "FROM") { j = j + 1; }
-        let dstName = tkVal(toks[j]);
-        let dst = szName(dstName);
-        j = j + 1;
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        return [j, applyArith(dst, dstName, dst + " - " + x, vars, ind)];
-    }
-
-    if (kw == "IF") {
+    if (kw == "CONTINUE" || kw == "NEXT") {
         let j = pos + 1;
-        let cond = "";
-        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
-            if (tkType(toks[j]) == "W" && tkUp(toks[j]) == "THEN") { j = j + 1; continue; }
-            cond = cond + condToken(toks[j], vars) + " ";
-            j = j + 1;
-        }
-        return [j, ind + "if (" + cond.trim() + ") \{\n"];
+        if (kw == "NEXT" && j < n && isWord(toks[j], "SENTENCE")) { j = j + 1; }
+        return [j, ind + "// " + kw + "\n"];
     }
-    if (kw == "ELSE") { return [pos + 1, ind + "\} else \{\n"]; }
-    if (kw == "END-IF") { return [pos + 1, ind + "\}\n"]; }
 
     if (kw == "PERFORM") {
-        let target = tkVal(toks[pos + 1]);
+        // out-of-line: PERFORM <para> [<n> TIMES | UNTIL c | VARYING ...]
+        let para = szName(tkVal(toks[pos + 1]));
         let j = pos + 2;
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        return [j, ind + szName(target) + "_();\n"];
+        if (j < n && isWord(toks[j], "UNTIL")) {
+            let r = grabCond(toks, j + 1, vars, "");
+            return [r[0], ind + "while (!(" + r[1] + ")) \{\n" + ind + "    " + para + "_();\n" + ind + "\}\n"];
+        }
+        if (j < n && isWord(toks[j], "VARYING")) {
+            let res = emitVarying(toks, j + 1, vars, ind);
+            let body = res[1] + ind + "    " + para + "_();\n" + res[2];
+            return [res[0], body];
+        }
+        if (j < n && tkType(toks[j]) == "N") {
+            let cnt = "__p" + pos;
+            let times = tkVal(toks[j]);
+            j = j + 1;
+            if (j < n && isWord(toks[j], "TIMES")) { j = j + 1; }
+            let body = ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + times + ") \{\n";
+            body = body + ind + "    " + para + "_();\n" + ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "\}\n";
+            return [j, body];
+        }
+        return [j, ind + para + "_();\n"];
     }
 
     if (kw == "STOP") {
-        // STOP RUN
         let j = pos + 1;
-        if (j < n && tkType(toks[j]) == "W") { j = j + 1; }
-        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
-        return [j, ind + "// STOP RUN\n"];
+        if (j < n && tkType(toks[j]) == "W") { j = j + 1; } // RUN
+        return [j, ind + "exit(0);\n"];
     }
 
-    // unknown keyword: skip to next '.'
+    // unknown: skip to next '.'
     let j = pos + 1;
-    while (j < n && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) { j = j + 1; }
-    return [j + 1, ind + "// unsupported: " + tkVal(t) + "\n"];
+    while (j < n && !isDot(toks[j])) { j = j + 1; }
+    return [j, ind + "// unsupported: " + tkVal(t) + "\n"];
 }
 
-// Wrap a numeric literal so it is an exact dec when assigned to a dec field.
-fn string decify(string operandText) {
-    // operandText is already translated; if it's a plain integer/decimal literal,
-    // append nothing for names; for bare numbers, dec context handles via setScale.
-    return operandText;
-}
-
-// Emit an arithmetic assignment with dec scaling when the destination is dec.
-fn string applyArith(string dst, string dstName, string rawExpr, [string] vars, string ind) {
-    let kind = varKind(vars, dstName);
-    if (kind == "dec") {
-        let sc = varScale(vars, dstName);
-        return ind + dst + " = (" + rawExpr + ").setScale(" + sc + ", \"down\");\n";
+// ADD/SUBTRACT/MULTIPLY/DIVIDE with optional GIVING/ROUNDED.
+fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op) {
+    let n = toks.length();
+    // collect operands until TO/FROM/BY/INTO/GIVING
+    let j = pos + 1;
+    let ops = [];
+    while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])
+           && !isWord(toks[j], "TO") && !isWord(toks[j], "FROM") && !isWord(toks[j], "BY")
+           && !isWord(toks[j], "INTO") && !isWord(toks[j], "GIVING")) {
+        ops.push(operand(vars, toks[j]));
+        j = j + 1;
     }
-    return ind + dst + " = (" + rawExpr + ");\n";
-}
-
-// Translate one token inside an IF condition (maps =, AND, OR, NOT).
-fn string condToken(string t, [string] vars) {
-    if (tkType(t) == "W") {
-        let u = tkUp(t);
-        if (u == "AND") { return "&&"; }
-        if (u == "OR")  { return "||"; }
-        if (u == "NOT") { return "!"; }
-        if (u == "ZERO" || u == "ZEROS" || u == "ZEROES") { return "0"; }
+    let connector = "";
+    if (j < n && tkType(toks[j]) == "W") { connector = tkUp(toks[j]); j = j + 1; }
+    // target operand(s)
+    let tgt = "";
+    if (j < n && tkType(toks[j]) == "W") { tgt = tkVal(toks[j]); j = j + 1; }
+    // GIVING <dst>
+    let giving = "";
+    let rounded = false;
+    while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
+        if (isWord(toks[j], "GIVING")) { j = j + 1; if (j < n) { giving = tkVal(toks[j]); j = j + 1; } continue; }
+        if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
+        j = j + 1;
     }
-    return operand(vars, t);
+
+    let acc = ops[0];
+    let k = 1;
+    while (k < ops.length()) {
+        if (op == "ADD") { acc = acc + " + " + ops[k]; }
+        else { acc = acc + " + " + ops[k]; }
+        k = k + 1;
+    }
+
+    let dst = "";
+    let expr = "";
+    if (giving != "") {
+        dst = giving;
+        if (op == "ADD")      { expr = acc + " + " + szName(tgt); }
+        if (op == "SUBTRACT") { expr = szName(tgt) + " - (" + acc + ")"; }
+        if (op == "MULTIPLY") { expr = acc + " * " + szName(tgt); }
+        if (op == "DIVIDE")   { expr = szName(tgt) + " / (" + acc + ")"; }
+    } else {
+        dst = tgt;
+        let d = szName(tgt);
+        if (op == "ADD")      { expr = d + " + (" + acc + ")"; }
+        if (op == "SUBTRACT") { expr = d + " - (" + acc + ")"; }
+        if (op == "MULTIPLY") { expr = d + " * (" + acc + ")"; }
+        if (op == "DIVIDE")   { expr = d + " / (" + acc + ")"; }
+    }
+    return [j, assignExpr(vars, dst, expr, rounded, ind)];
 }
 
-// ── 7. TOP-LEVEL TRANSLATE ────────────────────────────────────────────────────
+// ── assignment helpers (apply dec scaling to the destination) ─────────────────
+fn string assign([string] vars, string dstName, string src, string ind) {
+    let dst = szName(dstName);
+    if (varKind(vars, dstName) == "dec") {
+        // `+ 0m` lifts an int/int-literal source to exact dec so setScale applies.
+        return ind + dst + " = ((" + src + ") + 0m).setScale(" + varScale(vars, dstName) + ", \"down\");\n";
+    }
+    return ind + dst + " = " + src + ";\n";
+}
+fn string assignExpr([string] vars, string dstName, string expr, bool rounded, string ind) {
+    let dst = szName(dstName);
+    if (varKind(vars, dstName) == "dec") {
+        let mode = "down";
+        if (rounded) { mode = "half-up"; }
+        return ind + dst + " = ((" + expr + ") + 0m).setScale(" + varScale(vars, dstName) + ", \"" + mode + "\");\n";
+    }
+    return ind + dst + " = (" + expr + ");\n";
+}
+
+// ── 8. TOP-LEVEL TRANSLATE ────────────────────────────────────────────────────
 fn string translate(string src) {
-    let clean = src.replaceAll("\r", "");
-    let lines = clean.split("\n");
+    let lines = src.replaceAll("\r", "").split("\n");
     let toks = tokenizeAll(lines);
     let vars = collectVars(toks);
-    let header = "// Generated by serez-cobol from COBOL source.\n\n";
-    return header + emitVars(vars) + emitProcedure(toks, vars);
+    return "// Generated by serez-cobol from COBOL source.\n\n" + emitVars(vars) + emitProcedure(toks, vars);
 }
 
-// ── 8. CLI DRIVER ─────────────────────────────────────────────────────────────
+// ── 9. CLI DRIVER ─────────────────────────────────────────────────────────────
 let args = Env.args();
 let inFile = "";
 for (let a in args) {
@@ -533,10 +737,8 @@ if (inFile == "") {
     out "serez-cobol — COBOL → Serez (.sz) translator";
     out "usage: sz cobol.sz <input.cob>";
 } else {
-    let src = File.read(inFile);
-    let result = translate(src);
-    let base = inFile.substring(0, inFile.length() - 4);
-    let outFile = base + ".sz";
+    let result = translate(File.read(inFile));
+    let outFile = inFile.substring(0, inFile.length() - 4) + ".sz";
     File.write(outFile, result);
     out "translated " + inFile + " -> " + outFile;
 }
