@@ -870,7 +870,8 @@ fn string emitProcedure([string] toks, [string] vars) {
 // Returns [newPos, header, closeText].
 fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
     let n = toks.length();
-    let v = szName(tkVal(toks[pos]));
+    let base = tkVal(toks[pos]);
+    let v = szName(base);
     let j = pos + 1;
     if (j < n && isWord(toks[j], "FROM")) { j = j + 1; }
     let rf = grabExpr(toks, j, vars, "BY");
@@ -884,8 +885,9 @@ fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
     let rc = grabCond(toks, j, vars, "");
     let cond = rc[1];
     j = rc[0];
-    let header = ind + v + " = " + from + ";\n" + ind + "while (!(" + cond + ")) " + r"{" + "\n";
-    let close = ind + "    " + v + " = " + v + " + " + by + ";\n" + ind + "" + r"}" + "\n";
+    // FROM/BY honor the loop variable's type (a dec index gets scaled).
+    let header = assign(vars, base, v, from, ind) + ind + "while (!(" + cond + ")) " + r"{" + "\n";
+    let close = assignExpr(vars, base, v, v + " + (" + by + ")", false, ind + "    ") + ind + r"}" + "\n";
     return [j, header, close];
 }
 
@@ -1208,15 +1210,23 @@ fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op)
     let tgtBase = tl[2];
     j = tl[0];
 
-    // optional GIVING <dest> and ROUNDED
+    // optional GIVING <dest>, REMAINDER <dest> and ROUNDED
     let giveLhs = "";
     let giveBase = "";
+    let remLhs = "";
+    let remBase = "";
     let rounded = false;
     while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
         if (isWord(toks[j], "GIVING")) {
             j = j + 1;
             let gl = emitLhs(toks, j, vars);
             giveLhs = gl[1]; giveBase = gl[2]; j = gl[0];
+            continue;
+        }
+        if (isWord(toks[j], "REMAINDER")) {
+            j = j + 1;
+            let rl = emitLhs(toks, j, vars);
+            remLhs = rl[1]; remBase = rl[2]; j = rl[0];
             continue;
         }
         if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
@@ -1241,7 +1251,16 @@ fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op)
             else { expr = tgtLhs + " / (" + acc + ")"; }
         }
     }
-    return [j, assignExpr(vars, destBase, destLhs, expr, rounded, ind)];
+    let code = assignExpr(vars, destBase, destLhs, expr, rounded, ind);
+    // DIVIDE ... GIVING q REMAINDER r  →  r = dividend - q * divisor
+    if (remLhs != "" && op == "DIVIDE") {
+        let dvd = acc;
+        let dvs = tgtLhs;
+        if (conn == "INTO") { dvd = tgtLhs; dvs = acc; }
+        let rExpr = "(" + dvd + ") - (" + destLhs + " * (" + dvs + "))";
+        code = code + assignExpr(vars, remBase, remLhs, rExpr, false, ind);
+    }
+    return [j, code];
 }
 
 // ── assignment helpers (apply dec scaling to the destination) ─────────────────
