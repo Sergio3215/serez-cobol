@@ -592,6 +592,32 @@ fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
 }
 
 // ── 6. PROCEDURE DIVISION ─────────────────────────────────────────────────────
+// Ordered paragraph names (szName'd), '|'-joined — used for PERFORM ... THRU.
+fn string collectParagraphs([string] toks) {
+    let n = toks.length();
+    let start = -1;
+    let i = 0;
+    while (i < n) { if (isWord(toks[i], "PROCEDURE")) { start = i; break; } i = i + 1; }
+    if (start < 0) { return ""; }
+    i = start + 1;
+    while (i < n && !isDot(toks[i])) { i = i + 1; }
+    i = i + 1;
+    let order = "";
+    let atStart = true;   // a label is a WORD '.' only at the start of a sentence
+    while (i < n) {
+        let t = toks[i];
+        if (isDot(t)) { atStart = true; i = i + 1; continue; }
+        if (atStart && tkType(t) == "W" && !isStmtKw(t) && i + 1 < n && isDot(toks[i + 1])) {
+            order = order + szName(tkVal(t)) + "|";
+            i = i + 2;
+            continue;
+        }
+        atStart = false;
+        i = i + 1;
+    }
+    return order;
+}
+
 fn string collectPerformTargets([string] toks) {
     let targets = "";
     let n = toks.length();
@@ -626,6 +652,7 @@ fn string emitProcedure([string] toks, [string] vars) {
     let curName = "";
     let curBody = "";
     let paraOrder = "";
+    let paras = collectParagraphs(toks);   // ordered paragraph names (for PERFORM THRU)
     let curEof = "";       // eof flag var of the current READ (for AT END / NOT AT END)
     let closeStack = [];   // close-text per open block (for END-x and '.')
     let evalSubj = [];     // parallel: EVALUATE subject ("" for non-eval blocks)
@@ -789,14 +816,14 @@ fn string emitProcedure([string] toks, [string] vars) {
                 continue;
             }
             // out-of-line PERFORM <para> [...]
-            let r = emitStmt(toks, i, vars, ind);
+            let r = emitStmt(toks, i, vars, ind, paras);
             curBody = curBody + r[1];
             if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
             continue;
         }
 
         // leaf statement
-        let r = emitStmt(toks, i, vars, ind);
+        let r = emitStmt(toks, i, vars, ind, paras);
         curBody = curBody + r[1];
         if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
     }
@@ -807,12 +834,36 @@ fn string emitProcedure([string] toks, [string] vars) {
         paraOrder = paraOrder + szName(curName) + "|";
     }
 
-    let targets = collectPerformTargets(toks);
-    let calls = "";
+    // Driver: run paragraphs in source order with a program counter, so GO TO can
+    // jump and STOP RUN (exit) halts before falling through into PERFORMed-only
+    // paragraphs. Paragraphs are first-class function refs dispatched by index.
+    let order = "";
+    let refs = "";
     for (let nm in paraOrder.split("|")) {
-        if (nm != "" && !targets.includes(nm + "|")) { calls = calls + nm + "_();\n"; }
+        if (nm != "") {
+            if (order != "") { order = order + ", "; refs = refs + ", "; }
+            order = order + "\"" + nm + "\"";
+            refs = refs + nm + "_";
+        }
     }
-    return funcs + "// ── main ──\n" + mainCalls + calls;
+    let driver = "";
+    if (order != "") {
+        driver = "let __order = [" + order + "];\n";
+        driver = driver + "let __fns = [" + refs + "];\n";
+        driver = driver + "let __pc = 0;\n";
+        driver = driver + "while (__pc < __fns.length()) " + r"{" + "\n";
+        driver = driver + "    __goto = \"\";\n";
+        driver = driver + "    __fns[__pc]();\n";
+        driver = driver + "    if (__goto == \"\") " + r"{" + " __pc = __pc + 1; " + r"}" + "\n";
+        driver = driver + "    else " + r"{" + "\n";
+        driver = driver + "        let __k = 0;\n";
+        driver = driver + "        let __nx = -1;\n";
+        driver = driver + "        while (__k < __order.length()) " + r"{" + " if (__order[__k] == __goto) " + r"{" + " __nx = __k; " + r"}" + " __k = __k + 1; " + r"}" + "\n";
+        driver = driver + "        if (__nx >= 0) " + r"{" + " __pc = __nx; " + r"}" + " else " + r"{" + " __pc = __pc + 1; " + r"}" + "\n";
+        driver = driver + "    " + r"}" + "\n";
+        driver = driver + r"}" + "\n";
+    }
+    return "let __goto = \"\";\n\n" + funcs + "// ── main ──\n" + mainCalls + driver;
 }
 
 // PERFORM VARYING v FROM a BY b UNTIL c  → loop header + close text.
@@ -839,7 +890,26 @@ fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
 }
 
 // ── 7. LEAF STATEMENTS ────────────────────────────────────────────────────────
-fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
+// Emit the calls for a PERFORM <p1> THRU <p2> paragraph range, each at `ind`.
+fn string performRange(string paras, string p1, string p2, string ind) {
+    let names = paras.split("|");
+    let body = "";
+    let inR = false;
+    for (let nm in names) {
+        if (nm == p1) { inR = true; }
+        if (inR && nm != "") { body = body + ind + nm + "_();\n"; }
+        if (nm == p2) { inR = false; }
+    }
+    if (body == "") { body = ind + p1 + "_();\n"; }
+    return body;
+}
+// Body run by one PERFORM iteration: a single paragraph (p2 == "") or a range.
+fn string performBody(string paras, string p1, string p2, string ind) {
+    if (p2 == "") { return ind + p1 + "_();\n"; }
+    return performRange(paras, p1, p2, ind);
+}
+
+fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string paras) {
     let n = toks.length();
     let t = toks[pos];
     if (tkType(t) != "W") { return [pos + 1, ""]; }
@@ -991,6 +1061,15 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         return [j, code];
     }
 
+    if (kw == "GO") {
+        // GO TO <para>  (DEPENDING ON not supported yet)
+        let j = pos + 1;
+        if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
+        let target = szName(tkVal(toks[j]));
+        j = j + 1;
+        return [j, ind + "__goto = \"" + target + "\"; return;\n"];
+    }
+
     if (kw == "CONTINUE" || kw == "NEXT") {
         let j = pos + 1;
         if (kw == "NEXT" && j < n && isWord(toks[j], "SENTENCE")) { j = j + 1; }
@@ -998,17 +1077,23 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
     }
 
     if (kw == "PERFORM") {
-        // out-of-line: PERFORM <para> [<n> TIMES | UNTIL c | VARYING ...]
+        // out-of-line: PERFORM <para> [THRU <para2>] [<n> TIMES | UNTIL c | VARYING ...]
         let para = szName(tkVal(toks[pos + 1]));
         let j = pos + 2;
+        let inner = ind + "    ";
+        let p2 = "";
+        if (j < n && (isWord(toks[j], "THRU") || isWord(toks[j], "THROUGH"))) {
+            p2 = szName(tkVal(toks[j + 1]));
+            j = j + 2;
+        }
+        let bodyOnce = performBody(paras, para, p2, inner);
         if (j < n && isWord(toks[j], "UNTIL")) {
             let r = grabCond(toks, j + 1, vars, "");
-            return [r[0], ind + "while (!(" + r[1] + ")) " + r"{" + "\n" + ind + "    " + para + "_();\n" + ind + "" + r"}" + "\n"];
+            return [r[0], ind + "while (!(" + r[1] + ")) " + r"{" + "\n" + bodyOnce + ind + r"}" + "\n"];
         }
         if (j < n && isWord(toks[j], "VARYING")) {
             let res = emitVarying(toks, j + 1, vars, ind);
-            let body = res[1] + ind + "    " + para + "_();\n" + res[2];
-            return [res[0], body];
+            return [res[0], res[1] + bodyOnce + res[2]];
         }
         if (j < n && tkType(toks[j]) == "N") {
             let cnt = "__p" + pos;
@@ -1016,10 +1101,10 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
             j = j + 1;
             if (j < n && isWord(toks[j], "TIMES")) { j = j + 1; }
             let body = ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + times + ") " + r"{" + "\n";
-            body = body + ind + "    " + para + "_();\n" + ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "" + r"}" + "\n";
+            body = body + bodyOnce + inner + cnt + " = " + cnt + " + 1;\n" + ind + r"}" + "\n";
             return [j, body];
         }
-        return [j, ind + para + "_();\n"];
+        return [j, performBody(paras, para, p2, ind)];
     }
 
     if (kw == "OPEN") {
