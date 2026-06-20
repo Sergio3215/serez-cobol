@@ -615,6 +615,9 @@ fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
     let n = toks.length();
     let j = pos;
     let cond = "";
+    let prevOperand = "";   // last operand emitted (candidate implied subject)
+    let lastSubj = "";      // subject of the most recent relation
+    let lastOp = "";        // operator of the most recent relation
     while (j < n) {
         let tj = toks[j];
         if (isDot(tj) || isStmtKw(tj)) { break; }
@@ -652,11 +655,39 @@ fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
         }
         if (tkType(tj) == "O" || isRelWord(tj)) {
             let piece = condToken(vars, tj);
-            if (piece != "") { cond = cond + piece + " "; }
+            if (piece == "&&" || piece == "||") {
+                cond = cond + piece + " ";
+                j = j + 1;
+                // abbreviated combined condition: "X = 1 OR 2" → "X==1 || X==2"
+                if (lastSubj != "" && lastOp != "" && j < n) {
+                    let nt = toks[j];
+                    let isOperandTok = tkType(nt) == "N" || tkType(nt) == "D" || tkType(nt) == "S"
+                        || (tkType(nt) == "W" && !isRelWord(nt) && !isWord(nt, "NOT"));
+                    if (isOperandTok) {
+                        let rr = emitRef(toks, j, vars);
+                        let after = rr[0];
+                        let followedByRel = after < n && isRelOpTok(toks[after]);
+                        if (!followedByRel) {
+                            cond = cond + lastSubj + " " + lastOp + " " + rr[1] + " ";
+                            prevOperand = rr[1];
+                            j = after;
+                        }
+                    }
+                }
+                continue;
+            }
+            if (piece != "") {
+                cond = cond + piece + " ";
+                if (piece == ">" || piece == "<" || piece == "==" || piece == ">=" || piece == "<=" || piece == "!=") {
+                    lastSubj = prevOperand;
+                    lastOp = piece;
+                }
+            }
             j = j + 1;
         } else {
             let r = emitRef(toks, j, vars);
             cond = cond + r[1] + " ";
+            prevOperand = r[1];
             j = r[0];
         }
     }
@@ -1016,7 +1047,7 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
         let j = pos + 1;
         let parts = "";
         let first = true;
-        while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
+        while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j]) && !isWord(toks[j], "WITH")) {
             let r = emitRef(toks, j, vars);
             if (r[1] != "") {
                 if (first) { parts = r[1]; first = false; }
@@ -1024,6 +1055,8 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
             }
             j = r[0];
         }
+        // skip a trailing "WITH NO ADVANCING" (no-newline output is not emitted)
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
         if (parts == "") { parts = "\"\""; }
         return [j, ind + "out " + parts + ";\n"];
     }
@@ -1044,8 +1077,14 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
     }
 
     if (kw == "COMPUTE") {
-        let rl = emitLhs(toks, pos + 1, vars);
-        let j = rl[0];
+        // COMPUTE a [b c ...] = expr  — one or more destinations
+        let dstLhs = [];
+        let dstBase = [];
+        let j = pos + 1;
+        while (j < n && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == "=")) {
+            let rl = emitLhs(toks, j, vars);
+            dstLhs.push(rl[1]); dstBase.push(rl[2]); j = rl[0];
+        }
         if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == "=") { j = j + 1; }
         let expr = "";
         let rounded = false;
@@ -1055,7 +1094,13 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
             expr = expr + r[1] + " ";
             j = r[0];
         }
-        return [j, assignExpr(vars, rl[2], rl[1], expr.trim(), rounded, ind)];
+        let code = "";
+        let k = 0;
+        while (k < dstLhs.length()) {
+            code = code + assignExpr(vars, dstBase[k], dstLhs[k], expr.trim(), rounded, ind);
+            k = k + 1;
+        }
+        return [j, code];
     }
 
     if (kw == "ADD" || kw == "SUBTRACT" || kw == "MULTIPLY" || kw == "DIVIDE") {
