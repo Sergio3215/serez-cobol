@@ -992,28 +992,40 @@ fn string emitProcedure([string] toks, [string] vars) {
     return "let __goto = \"\";\n\n" + funcs + "// ── main ──\n" + mainCalls + driver;
 }
 
-// PERFORM VARYING v FROM a BY b UNTIL c  → loop header + close text.
-// Returns [newPos, header, closeText].
+// PERFORM VARYING v FROM a BY b UNTIL c [AFTER w FROM .. BY .. UNTIL ..]  →
+// (possibly nested) loop header + close text. Returns [newPos, header, closeText].
 fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
     let n = toks.length();
-    let base = tkVal(toks[pos]);
-    let v = szName(base);
-    let j = pos + 1;
-    if (j < n && isWord(toks[j], "FROM")) { j = j + 1; }
-    let rf = grabExpr(toks, j, vars, "BY");
-    let from = rf[1];
-    j = rf[0];
-    if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
-    let rb = grabExpr(toks, j, vars, "UNTIL");
-    let by = rb[1];
-    j = rb[0];
-    if (j < n && isWord(toks[j], "UNTIL")) { j = j + 1; }
-    let rc = grabCond(toks, j, vars, "");
-    let cond = rc[1];
-    j = rc[0];
-    // FROM/BY honor the loop variable's type (a dec index gets scaled).
-    let header = assign(vars, base, v, from, ind) + ind + "while (!(" + cond + ")) " + r"{" + "\n";
-    let close = assignExpr(vars, base, v, v + " + (" + by + ")", false, ind + "    ") + ind + r"}" + "\n";
+    let header = "";
+    let close = "";
+    let depth = 0;
+    let j = pos;
+    let more = true;
+    while (more) {
+        let base = tkVal(toks[j]);
+        let v = szName(base);
+        j = j + 1;
+        if (j < n && isWord(toks[j], "FROM")) { j = j + 1; }
+        let rf = grabExpr(toks, j, vars, "BY");
+        let from = rf[1];
+        j = rf[0];
+        if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+        let rb = grabExpr(toks, j, vars, "UNTIL");
+        let by = rb[1];
+        j = rb[0];
+        if (j < n && isWord(toks[j], "UNTIL")) { j = j + 1; }
+        // UNTIL condition stops at AFTER (next nested VARYING clause)
+        let rc = grabCond(toks, j, vars, "AFTER");
+        let cond = rc[1];
+        j = rc[0];
+        let cur = ind + indentOf(depth);
+        // FROM/BY honor the loop variable's type (a dec index gets scaled).
+        header = header + assign(vars, base, v, from, cur) + cur + "while (!(" + cond + ")) " + r"{" + "\n";
+        // inner loops close first → prepend this loop's close
+        close = assignExpr(vars, base, v, v + " + (" + by + ")", false, cur + "    ") + cur + r"}" + "\n" + close;
+        depth = depth + 1;
+        if (j < n && isWord(toks[j], "AFTER")) { j = j + 1; } else { more = false; }
+    }
     return [j, header, close];
 }
 
