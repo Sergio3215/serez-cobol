@@ -20,13 +20,17 @@ WS_TAX = ((WS_SUBTOTAL * 0.21m) + 0m).setScale(2, "half-up");
 ## Usage
 
 ```sh
+# simplest — auto-detect direction by extension:
+sz index.sz examples/invoice.cob      # .cob/.cbl → COBOL→.sz ; .sz → .sz→COBOL (planned)
+                                       # anything else → a clear error
+
+# explicit command:
+sz serezTransform.sz toSerez examples/invoice.cob   # COBOL → .sz
+sz serezTransform.sz toCobol examples/invoice.sz    # .sz → COBOL  (planned)
+
 # direct engine:
 sz cobol.sz examples/invoice.cob      # writes examples/invoice.sz
 sz examples/invoice.sz                # run the translated program
-
-# or via the unified CLI:
-sz serezTransform.sz toSerez examples/invoice.cob   # COBOL → .sz  (delegates to cobol.sz)
-sz serezTransform.sz toCobol examples/invoice.sz    # .sz → COBOL  (planned, future)
 ```
 
 `cobol.sz` needs the `File` and `Env` permissions (in `serez.json` / via
@@ -106,6 +110,7 @@ its output compared against `examples/<name>.expected` (11 end-to-end cases).
 ## Layout
 
 ```
+index.sz             auto-detecting entry point (routes by file extension)
 serezTransform.sz    unified CLI dispatcher (toSerez / toCobol)
 cobol.sz             the COBOL→sz engine (lexer + parser + emitter + COPY + CLI)
 runtime/cobol_rt.sz  PIC-editing runtime, prepended when edited fields are used

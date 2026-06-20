@@ -1,0 +1,41 @@
+// index — auto-detecting entry point for serez-cobol.
+// Picks the translation direction from the input file extension and delegates
+// to serezTransform.sz:
+//   *.cob / *.cbl  → toSerez (COBOL → Serez .sz)
+//   *.sz           → toCobol (Serez .sz → COBOL)   [planned]
+//   anything else  → error
+//
+//   sz index.sz <file>      # run from the repo root
+
+use permissions { OS, Env, File }
+
+// the input is the first argument after this script
+let file = "";
+let past = false;
+for (let a in Env.args()) {
+    if (past) {
+        if (file == "") { file = a; }
+    } else if (a.toLowerCase().endsWith("index.sz")) {
+        past = true;
+    }
+}
+
+let low = file.toLowerCase();
+let cmd = "";
+if (low.endsWith(".cob") || low.endsWith(".cbl")) { cmd = "toSerez"; }
+else if (low.endsWith(".sz")) { cmd = "toCobol"; }
+
+if (file == "") {
+    out "index — serez-cobol auto dispatcher";
+    out "usage: sz index.sz <file.cob | file.sz>";
+} else if (cmd == "") {
+    out "ERROR: '" + file + "' is not a COBOL or Serez source.";
+    out "Expected a .cob/.cbl (COBOL) or .sz (Serez) file.";
+} else {
+    let r = null;
+    unsafe { r = OS.exec("sz", ["serezTransform.sz", cmd, file]); }
+    let so = r.stdout.trim();
+    let se = r.stderr.trim();
+    if (so != "") { out so; }
+    if (se != "") { out se; }
+}
