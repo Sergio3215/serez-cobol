@@ -86,7 +86,7 @@ fn [string] tokenizeAll([string] lines) {
                 if (i + 1 < n && line[i + 1] == "=") { toks.push("O:<="); i = i + 2; }
                 else { toks.push("O:<"); i = i + 1; }
             } else if (c == "(" || c == ")" || c == "." || c == "=" ||
-                       c == "+" || c == "*" || c == "/" || c == "-") {
+                       c == "+" || c == "*" || c == "/" || c == "-" || c == ":") {
                 toks.push("O:" + c);
                 i = i + 1;
             } else {
@@ -325,28 +325,44 @@ fn bool isRelWord(string t) {
 fn [any] emitRef([string] toks, int pos, [string] vars) {
     let n = toks.length();
     let t = toks[pos];
-    if (tkType(t) == "W") {
+    if (tkType(t) == "W" && pos + 1 < n
+        && tkType(toks[pos + 1]) == "O" && tkVal(toks[pos + 1]) == "(") {
         let nm = tkVal(t);
-        if (varOccurs(vars, nm) > 0 && pos + 1 < n
-            && tkType(toks[pos + 1]) == "O" && tkVal(toks[pos + 1]) == "(") {
-            let j = pos + 2;
-            let depth = 1;
-            let sub = "";
-            while (j < n && depth > 0) {
-                let tj = toks[j];
-                if (tkType(tj) == "O" && tkVal(tj) == "(") { depth = depth + 1; sub = sub + "( "; j = j + 1; continue; }
-                if (tkType(tj) == "O" && tkVal(tj) == ")") {
-                    depth = depth - 1;
-                    if (depth == 0) { j = j + 1; break; }
-                    sub = sub + ") "; j = j + 1; continue;
-                }
-                sub = sub + operand(vars, tj) + " ";
-                j = j + 1;
+        // collect the parenthesized content; a ':' at depth 1 ⇒ reference modification
+        let j = pos + 2;
+        let depth = 1;
+        let part1 = "";
+        let part2 = "";
+        let hasColon = false;
+        while (j < n && depth > 0) {
+            let tj = toks[j];
+            if (tkType(tj) == "O" && tkVal(tj) == "(") {
+                depth = depth + 1;
+                if (hasColon) { part2 = part2 + "( "; } else { part1 = part1 + "( "; }
+                j = j + 1; continue;
             }
-            return [j, szName(nm) + "[(" + sub.trim() + ") - 1]"];
+            if (tkType(tj) == "O" && tkVal(tj) == ")") {
+                depth = depth - 1;
+                if (depth == 0) { j = j + 1; break; }
+                if (hasColon) { part2 = part2 + ") "; } else { part1 = part1 + ") "; }
+                j = j + 1; continue;
+            }
+            if (tkType(tj) == "O" && tkVal(tj) == ":" && depth == 1) { hasColon = true; j = j + 1; continue; }
+            if (hasColon) { part2 = part2 + operand(vars, tj) + " "; }
+            else { part1 = part1 + operand(vars, tj) + " "; }
+            j = j + 1;
         }
-        return [pos + 1, operand(vars, t)];
+        if (hasColon) {
+            // COBOL ref-mod NAME(start:len) → 1-indexed substring → .substring(start-1, start-1+len)
+            let st = "(" + part1.trim() + ") - 1";
+            return [j, szName(nm) + ".substring(" + st + ", (" + st + ") + (" + part2.trim() + "))"];
+        }
+        if (varOccurs(vars, nm) > 0) {
+            return [j, szName(nm) + "[(" + part1.trim() + ") - 1]"];
+        }
+        return [j, szName(nm) + "(" + part1.trim() + ")"];
     }
+    if (tkType(t) == "W") { return [pos + 1, operand(vars, t)]; }
     return [pos + 1, operand(vars, t)];
 }
 
@@ -367,7 +383,8 @@ fn bool isStmtKw(string t) {
         || u == "ELSE" || u == "END-IF" || u == "PERFORM" || u == "STOP"
         || u == "ACCEPT" || u == "EVALUATE" || u == "WHEN" || u == "END-EVALUATE"
         || u == "END-PERFORM" || u == "CONTINUE" || u == "INITIALIZE"
-        || u == "GO" || u == "NEXT";
+        || u == "GO" || u == "NEXT" || u == "STRING" || u == "UNSTRING"
+        || u == "INSPECT";
 }
 
 // Build an expression from pos until a stmt keyword / '.' / optional stop word.
@@ -682,7 +699,90 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         let j = pos + 2;
         // ACCEPT x FROM DATE/TIME → DateTime (skip the FROM clause)
         if (j < n && isWord(toks[j], "FROM")) { while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; } }
-        return [j, ind + szName(dstName) + " = input();\n"];
+        return [j, ind + szName(dstName) + " = readLine();\n"];
+    }
+
+    if (kw == "STRING") {
+        // STRING a [DELIMITED BY x] b ... INTO dest [END-STRING]
+        let j = pos + 1;
+        let src = "";
+        let first = true;
+        while (j < n && !isWord(toks[j], "INTO") && !isDot(toks[j]) && !isStmtKw(toks[j])) {
+            if (isWord(toks[j], "DELIMITED")) {
+                j = j + 1;
+                if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+                if (j < n) { j = j + 1; } // SIZE / SPACE / literal
+                continue;
+            }
+            let r = emitRef(toks, j, vars);
+            if (r[1] != "") { if (first) { src = r[1]; first = false; } else { src = src + " + " + r[1]; } }
+            j = r[0];
+        }
+        if (j < n && isWord(toks[j], "INTO")) { j = j + 1; }
+        let dl = emitLhs(toks, j, vars);
+        j = dl[0];
+        // skip to end of statement (END-STRING / '.')
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j]) && !isWord(toks[j], "END-STRING")) { j = j + 1; }
+        if (j < n && isWord(toks[j], "END-STRING")) { j = j + 1; }
+        if (src == "") { src = "\"\""; }
+        return [j, ind + dl[1] + " = " + src + ";\n"];
+    }
+
+    if (kw == "UNSTRING") {
+        // UNSTRING src DELIMITED BY d INTO a b c [END-UNSTRING]
+        let rs = emitRef(toks, pos + 1, vars);
+        let src = rs[1];
+        let j = rs[0];
+        let delim = "\" \"";
+        if (j < n && isWord(toks[j], "DELIMITED")) {
+            j = j + 1;
+            if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+            if (j < n) { delim = operand(vars, toks[j]); j = j + 1; }
+        }
+        if (j < n && isWord(toks[j], "INTO")) { j = j + 1; }
+        let dests = [];
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j]) && !isWord(toks[j], "END-UNSTRING")) {
+            let dl = emitLhs(toks, j, vars);
+            dests.push(dl[1]);
+            j = dl[0];
+        }
+        if (j < n && isWord(toks[j], "END-UNSTRING")) { j = j + 1; }
+        let tmp = "__u" + pos;
+        let code = ind + "let " + tmp + " = (" + src + ").split(" + delim + ");\n";
+        let k = 0;
+        while (k < dests.length()) {
+            code = code + ind + dests[k] + " = (" + k + " < " + tmp + ".length()) ? " + tmp + "[" + k + "] : \"\";\n";
+            k = k + 1;
+        }
+        return [j, code];
+    }
+
+    if (kw == "INSPECT") {
+        // INSPECT src TALLYING cnt FOR ALL x  |  REPLACING ALL a BY b
+        let rs = emitRef(toks, pos + 1, vars);
+        let src = rs[1];
+        let j = rs[0];
+        let code = ind + "// INSPECT\n";
+        if (j < n && isWord(toks[j], "TALLYING")) {
+            j = j + 1;
+            let cl = emitLhs(toks, j, vars); j = cl[0];
+            if (j < n && isWord(toks[j], "FOR")) { j = j + 1; }
+            if (j < n && (isWord(toks[j], "ALL") || isWord(toks[j], "LEADING"))) { j = j + 1; }
+            let needle = "\"\"";
+            if (j < n) { needle = operand(vars, toks[j]); j = j + 1; }
+            code = ind + cl[1] + " = (" + src + ").split(" + needle + ").length() - 1;\n";
+        } else if (j < n && isWord(toks[j], "REPLACING")) {
+            j = j + 1;
+            if (j < n && (isWord(toks[j], "ALL") || isWord(toks[j], "LEADING") || isWord(toks[j], "FIRST"))) { j = j + 1; }
+            let fromV = "\"\"";
+            if (j < n) { fromV = operand(vars, toks[j]); j = j + 1; }
+            if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+            let toV = "\"\"";
+            if (j < n) { toV = operand(vars, toks[j]); j = j + 1; }
+            code = ind + rs[1] + " = (" + src + ").replaceAll(" + fromV + ", " + toV + ");\n";
+        }
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
+        return [j, code];
     }
 
     if (kw == "CONTINUE" || kw == "NEXT") {
