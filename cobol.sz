@@ -859,9 +859,17 @@ fn string emitProcedure([string] toks, [string] vars) {
                     part = "(" + r[1] + ")";
                     k = r[0];
                 } else {
-                    let r = grabExpr(toks, k, vars, "");
-                    part = "(" + subj + " == " + r[1] + ")";
-                    k = r[0];
+                    // value, or a "v1 THRU v2" range
+                    let r1 = emitRef(toks, k, vars);
+                    let v1 = r1[1];
+                    k = r1[0];
+                    if (k < n && (isWord(toks[k], "THRU") || isWord(toks[k], "THROUGH"))) {
+                        let r2 = emitRef(toks, k + 1, vars);
+                        part = "(" + subj + " >= " + v1 + " && " + subj + " <= " + r2[1] + ")";
+                        k = r2[0];
+                    } else {
+                        part = "(" + subj + " == " + v1 + ")";
+                    }
                 }
                 if (cond == "") { cond = part; } else { cond = cond + " || " + part; }
                 if (k + 1 < n && isWord(toks[k], "WHEN") && !isWord(toks[k + 1], "OTHER")) {
