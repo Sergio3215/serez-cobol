@@ -1,0 +1,542 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// serez-cobol — a COBOL → Serez (.sz) source-to-source translator.
+//
+// v0.1 subset (free-format COBOL):
+//   IDENTIFICATION / DATA (WORKING-STORAGE) / PROCEDURE divisions
+//   PIC 9(n) → int · 9(n)V9(m) / S9..V.. → dec · X(n) → string
+//   DISPLAY · MOVE · COMPUTE [ROUNDED] · ADD..TO · SUBTRACT..FROM
+//   IF / ELSE / END-IF · PERFORM <paragraph> · STOP RUN · paragraphs
+//
+// Written in pure .sz — it depends only on the serez-code core (the exact `dec`
+// type makes COBOL fixed-point arithmetic faithful). No core changes.
+//
+// Usage:  sz cobol.sz <input.cob>     # writes <input>.sz next to it
+// ─────────────────────────────────────────────────────────────────────────────
+
+use permissions { File, Env }
+
+// ── character classes ────────────────────────────────────────────────────────
+fn bool isDigitCh(string c) { return "0123456789".includes(c); }
+fn bool isAlphaCh(string c) {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_".includes(c);
+}
+
+// ── token helpers ── tokens are strings "T:value", T in {W,S,N,D,O} ───────────
+fn string tkType(string t) { return t.substring(0, 1); }
+fn string tkVal(string t)  { return t.substring(2); }
+fn string tkUp(string t)   { return t.substring(2).toUpperCase(); }
+
+// COBOL identifiers use '-'; .sz identifiers can't, so map '-' → '_'.
+fn string szName(string cobName) { return cobName.replaceAll("-", "_"); }
+
+// ── 1. TOKENIZER ─────────────────────────────────────────────────────────────
+fn [string] tokenizeAll([string] lines) {
+    let toks = [];
+    for (let raw in lines) {
+        let line = raw.replaceAll("\r", "");
+        let trimmed = line.trim();
+        // Whole-line comment: free-format '*' or '*>' at start.
+        if (trimmed.startsWith("*")) { continue; }
+        let i = 0;
+        let n = line.length();
+        while (i < n) {
+            let c = line[i];
+            if (c == " " || c == "\t") {
+                i = i + 1;
+            } else if (c == "\"" || c == "'") {
+                let q = c;
+                i = i + 1;
+                let s = "";
+                while (i < n && line[i] != q) { s = s + line[i]; i = i + 1; }
+                i = i + 1; // closing quote
+                toks.push("S:" + s);
+            } else if (isDigitCh(c)) {
+                let num = "";
+                let isDec = false;
+                let go = true;
+                while (i < n && go) {
+                    let ch = line[i];
+                    if (isDigitCh(ch)) { num = num + ch; i = i + 1; }
+                    else if (ch == "." && i + 1 < n && isDigitCh(line[i + 1])) {
+                        num = num + ch; isDec = true; i = i + 1;
+                    } else { go = false; }
+                }
+                if (isDec) { toks.push("D:" + num); } else { toks.push("N:" + num); }
+            } else if (isAlphaCh(c)) {
+                let w = "";
+                while (i < n && (isAlphaCh(line[i]) || isDigitCh(line[i]) || line[i] == "-")) {
+                    w = w + line[i]; i = i + 1;
+                }
+                toks.push("W:" + w);
+            } else if (c == ">") {
+                if (i + 1 < n && line[i + 1] == "=") { toks.push("O:>="); i = i + 2; }
+                else { toks.push("O:>"); i = i + 1; }
+            } else if (c == "<") {
+                if (i + 1 < n && line[i + 1] == "=") { toks.push("O:<="); i = i + 2; }
+                else { toks.push("O:<"); i = i + 1; }
+            } else if (c == "(" || c == ")" || c == "." || c == "=" ||
+                       c == "+" || c == "*" || c == "/" || c == "-") {
+                toks.push("O:" + c);
+                i = i + 1;
+            } else {
+                i = i + 1; // skip commas, semicolons, unknown
+            }
+        }
+    }
+    return toks;
+}
+
+// ── 2. PIC parsing ── returns "kind|scale" ── kind: int|dec|string ────────────
+fn string picInfo(string mask) {
+    let m = mask.toUpperCase();
+    if (m.includes("X")) { return "string|0"; }
+    // count fractional digits after V
+    let vi = m.indexOf("V");
+    if (vi >= 0) {
+        let frac = m.substring(vi + 1);
+        let scale = countNines(frac);
+        return "dec|" + scale;
+    }
+    return "int|0";
+}
+
+// Count the digit positions a PIC fragment denotes: "99" → 2, "9(4)" → 4.
+fn int countNines(string frag) {
+    let f = frag.toUpperCase();
+    let count = 0;
+    let i = 0;
+    let n = f.length();
+    while (i < n) {
+        let c = f[i];
+        if (c == "9") { count = count + 1; i = i + 1; }
+        else if (c == "(") {
+            let num = "";
+            i = i + 1;
+            while (i < n && f[i] != ")") { num = num + f[i]; i = i + 1; }
+            i = i + 1;
+            count = count + parseInt(num);
+        } else { i = i + 1; }
+    }
+    return count;
+}
+
+// ── 3. COLLECT WORKING-STORAGE VARIABLES ──────────────────────────────────────
+// Each entry: "NAME|kind|scale|initLiteral"
+fn [string] collectVars([string] toks) {
+    let vars = [];
+    let n = toks.length();
+    // locate WORKING-STORAGE .. PROCEDURE
+    let i = 0;
+    let inWS = false;
+    while (i < n) {
+        let t = toks[i];
+        if (tkType(t) == "W") {
+            let up = tkUp(t);
+            if (up == "WORKING-STORAGE") { inWS = true; i = i + 1; continue; }
+            if (up == "PROCEDURE") { break; }
+        }
+        if (!inWS) { i = i + 1; continue; }
+
+        // a declaration starts with a level number: N:01, N:05, N:77 ...
+        if (tkType(t) == "N") {
+            // next token is the name (W)
+            if (i + 1 < n && tkType(toks[i + 1]) == "W") {
+                let name = tkVal(toks[i + 1]);
+                let kind = "string";
+                let scale = 0;
+                let init = "";
+                let j = i + 2;
+                // scan to end of declaration ('.')
+                let mask = "";
+                let inPic = false;
+                let valNext = false;
+                let initSet = false;
+                while (j < n) {
+                    let tj = toks[j];
+                    if (tkType(tj) == "O" && tkVal(tj) == ".") { j = j + 1; break; }
+                    if (tkType(tj) == "W" && (tkUp(tj) == "PIC" || tkUp(tj) == "PICTURE")) {
+                        inPic = true; j = j + 1; continue;
+                    }
+                    if (tkType(tj) == "W" && tkUp(tj) == "VALUE") {
+                        inPic = false; valNext = true; j = j + 1; continue;
+                    }
+                    if (valNext) {
+                        if (tkType(tj) == "S") { init = "\"" + tkVal(tj) + "\""; }
+                        else if (tkType(tj) == "D") { init = tkVal(tj); }
+                        else if (tkType(tj) == "N") { init = tkVal(tj); }
+                        else if (tkType(tj) == "W") {
+                            let vu = tkUp(tj);
+                            if (vu == "ZERO" || vu == "ZEROS" || vu == "ZEROES") { init = "0"; }
+                            else if (vu == "SPACE" || vu == "SPACES") { init = "\"\""; }
+                        }
+                        initSet = true;
+                        valNext = false;
+                        j = j + 1;
+                        continue;
+                    }
+                    if (inPic) { mask = mask + tkVal(tj); j = j + 1; continue; }
+                    j = j + 1;
+                }
+                let info = picInfo(mask);
+                let parts = info.split("|");
+                kind = parts[0];
+                scale = parseInt(parts[1]);
+                // default init by kind when none given
+                if (!initSet) {
+                    if (kind == "string") { init = "\"\""; } else { init = "0"; }
+                }
+                vars.push(name + "|" + kind + "|" + scale + "|" + init);
+                i = j;
+                continue;
+            }
+        }
+        i = i + 1;
+    }
+    return vars;
+}
+
+// ── variable lookups against the collected table ──────────────────────────────
+fn int varIndex([string] vars, string name) {
+    let i = 0;
+    while (i < vars.length()) {
+        if (vars[i].split("|")[0] == name) { return i; }
+        i = i + 1;
+    }
+    return -1;
+}
+fn string varKind([string] vars, string name) {
+    let idx = varIndex(vars, name);
+    if (idx < 0) { return "?"; }
+    return vars[idx].split("|")[1];
+}
+fn int varScale([string] vars, string name) {
+    let idx = varIndex(vars, name);
+    if (idx < 0) { return 0; }
+    return parseInt(vars[idx].split("|")[2]);
+}
+
+// ── 4. EMIT WORKING-STORAGE AS .sz GLOBALS ────────────────────────────────────
+fn string emitVars([string] vars) {
+    let s = "";
+    let i = 0;
+    while (i < vars.length()) {
+        let p = vars[i].split("|");
+        let name = szName(p[0]);
+        let kind = p[1];
+        let scale = parseInt(p[2]);
+        let init = p[3];
+        let rhs = init;
+        if (kind == "dec") {
+            // make the literal exact and fix the scale
+            if (init == "0") { rhs = "0m"; } else { rhs = init + "m"; }
+            rhs = "(" + rhs + ").setScale(" + scale + ", \"down\")";
+        } else if (kind == "int") {
+            if (init == "") { rhs = "0"; }
+        }
+        s = s + "let " + name + " = " + rhs + ";\n";
+        i = i + 1;
+    }
+    return s + "\n";
+}
+
+// ── 5. EXPRESSION / OPERAND TRANSLATION ───────────────────────────────────────
+// Translate one operand token to .sz text (names, literals).
+fn string operand([string] vars, string t) {
+    let ty = tkType(t);
+    if (ty == "W") {
+        let up = tkUp(t);
+        if (up == "ZERO" || up == "ZEROS" || up == "ZEROES") { return "0"; }
+        if (up == "SPACE" || up == "SPACES") { return "\"\""; }
+        return szName(tkVal(t));
+    }
+    if (ty == "S") { return "\"" + tkVal(t) + "\""; }
+    if (ty == "D") { return tkVal(t) + "m"; }   // decimal literal → exact dec
+    if (ty == "N") { return tkVal(t); }
+    if (ty == "O") {
+        let v = tkVal(t);
+        if (v == "=") { return "=="; }
+        return v; // + - * / ( ) > < >= <=
+    }
+    return "";
+}
+
+// Is this token a statement-starting keyword? (ends the previous clause)
+fn bool isStmtKw(string t) {
+    if (tkType(t) != "W") { return false; }
+    let u = tkUp(t);
+    return u == "DISPLAY" || u == "MOVE" || u == "COMPUTE" || u == "ADD"
+        || u == "SUBTRACT" || u == "IF" || u == "ELSE" || u == "END-IF"
+        || u == "PERFORM" || u == "STOP" || u == "ACCEPT";
+}
+
+// Collect names targeted by PERFORM (they are subroutines, not main-flow). '|'-joined.
+fn string collectPerformTargets([string] toks) {
+    let targets = "";
+    let n = toks.length();
+    let i = 0;
+    while (i < n) {
+        if (tkType(toks[i]) == "W" && tkUp(toks[i]) == "PERFORM" && i + 1 < n
+            && tkType(toks[i + 1]) == "W") {
+            targets = targets + szName(tkVal(toks[i + 1])) + "|";
+        }
+        i = i + 1;
+    }
+    return targets;
+}
+
+// ── 6. EMIT PROCEDURE DIVISION ────────────────────────────────────────────────
+// Two passes: paragraphs become fn PARA_() {...}; loose code becomes main body.
+fn string emitProcedure([string] toks, [string] vars) {
+    let n = toks.length();
+    // find start of PROCEDURE DIVISION (after its '.')
+    let start = -1;
+    let i = 0;
+    while (i < n) {
+        if (tkType(toks[i]) == "W" && tkUp(toks[i]) == "PROCEDURE") { start = i; break; }
+        i = i + 1;
+    }
+    if (start < 0) { return "// (no PROCEDURE DIVISION)\n"; }
+    // skip 'PROCEDURE DIVISION .'
+    i = start + 1;
+    while (i < n && !(tkType(toks[i]) == "O" && tkVal(toks[i]) == ".")) { i = i + 1; }
+    i = i + 1; // past the '.'
+
+    // Split the procedure body into paragraphs. paraNames[k] / paraBody[k] (sz text).
+    // Leading statements before the first label go into the "main" stream.
+    let funcs = "";       // emitted fn definitions
+    let mainCalls = "";   // emitted main body
+    let curName = "";     // current paragraph (or "" for main)
+    let curBody = "";
+    let indent = "    ";
+    let paraOrder = "";   // paragraph names in declaration order, '|'-joined
+
+    while (i < n) {
+        let t = toks[i];
+        // paragraph label: a bare WORD immediately followed by '.'
+        if (tkType(t) == "W" && !isStmtKw(t) && i + 1 < n
+            && tkType(toks[i + 1]) == "O" && tkVal(toks[i + 1]) == ".") {
+            // flush current
+            if (curName == "") { mainCalls = mainCalls + curBody; }
+            else {
+                funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
+                paraOrder = paraOrder + szName(curName) + "|";
+            }
+            curName = tkVal(t);
+            curBody = "";
+            i = i + 2;
+            continue;
+        }
+        // a statement → translate it; advance i past it
+        let r = emitStmt(toks, i, vars, indent);
+        let newi = r[0];
+        let code = r[1];
+        curBody = curBody + code;
+        if (newi <= i) { i = i + 1; } else { i = newi; }
+    }
+    // flush last
+    if (curName == "") { mainCalls = mainCalls + curBody; }
+    else {
+        funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
+        paraOrder = paraOrder + szName(curName) + "|";
+    }
+
+    // COBOL falls through paragraphs top-to-bottom. PERFORM targets are
+    // subroutines, so the main flow only calls the non-PERFORMed paragraphs in
+    // order (the common "MAIN does PERFORMs then STOP RUN" pattern).
+    let targets = collectPerformTargets(toks);
+    let calls = "";
+    let names = paraOrder.split("|");
+    for (let nm in names) {
+        if (nm != "" && !targets.includes(nm + "|")) { calls = calls + nm + "_();\n"; }
+    }
+
+    return funcs + "// ── main ──\n" + mainCalls + calls;
+}
+
+// Translate the statement starting at `pos`. Returns ["newPos", "code"].
+fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
+    let n = toks.length();
+    let t = toks[pos];
+    if (tkType(t) != "W") { return [pos + 1, ""]; }
+    let kw = tkUp(t);
+
+    if (kw == "DISPLAY") {
+        let j = pos + 1;
+        let parts = "";
+        let first = true;
+        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
+            let piece = operand(vars, toks[j]);
+            if (piece != "") {
+                if (first) { parts = piece; first = false; }
+                else { parts = parts + " + " + piece; }
+            }
+            j = j + 1;
+        }
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        if (parts == "") { parts = "\"\""; }
+        return [j, ind + "out " + parts + ";\n"];
+    }
+
+    if (kw == "MOVE") {
+        // MOVE <src> TO <dst>
+        let src = operand(vars, toks[pos + 1]);
+        let j = pos + 2;
+        // skip TO
+        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "TO") { j = j + 1; }
+        let dstName = tkVal(toks[j]);
+        let dst = szName(dstName);
+        j = j + 1;
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        let kind = varKind(vars, dstName);
+        let code = "";
+        if (kind == "dec") {
+            let sc = varScale(vars, dstName);
+            code = ind + dst + " = (" + decify(src) + ").setScale(" + sc + ", \"down\");\n";
+        } else {
+            code = ind + dst + " = " + src + ";\n";
+        }
+        return [j, code];
+    }
+
+    if (kw == "COMPUTE") {
+        // COMPUTE <dst> = <expr> [ROUNDED]
+        let dstName = tkVal(toks[pos + 1]);
+        let dst = szName(dstName);
+        let j = pos + 2;
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == "=") { j = j + 1; }
+        let expr = "";
+        let rounded = false;
+        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
+            if (tkType(toks[j]) == "W" && tkUp(toks[j]) == "ROUNDED") { rounded = true; j = j + 1; continue; }
+            expr = expr + operand(vars, toks[j]) + " ";
+            j = j + 1;
+        }
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        let kind = varKind(vars, dstName);
+        let code = "";
+        if (kind == "dec") {
+            let sc = varScale(vars, dstName);
+            let mode = "down";
+            if (rounded) { mode = "half-up"; }
+            code = ind + dst + " = (" + expr.trim() + ").setScale(" + sc + ", \"" + mode + "\");\n";
+        } else {
+            code = ind + dst + " = (" + expr.trim() + ");\n";
+        }
+        return [j, code];
+    }
+
+    if (kw == "ADD") {
+        // ADD <x> TO <dst>
+        let x = operand(vars, toks[pos + 1]);
+        let j = pos + 2;
+        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "TO") { j = j + 1; }
+        let dstName = tkVal(toks[j]);
+        let dst = szName(dstName);
+        j = j + 1;
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        return [j, applyArith(dst, dstName, dst + " + " + x, vars, ind)];
+    }
+
+    if (kw == "SUBTRACT") {
+        // SUBTRACT <x> FROM <dst>
+        let x = operand(vars, toks[pos + 1]);
+        let j = pos + 2;
+        if (j < n && tkType(toks[j]) == "W" && tkUp(toks[j]) == "FROM") { j = j + 1; }
+        let dstName = tkVal(toks[j]);
+        let dst = szName(dstName);
+        j = j + 1;
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        return [j, applyArith(dst, dstName, dst + " - " + x, vars, ind)];
+    }
+
+    if (kw == "IF") {
+        let j = pos + 1;
+        let cond = "";
+        while (j < n && !isStmtKw(toks[j]) && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) {
+            if (tkType(toks[j]) == "W" && tkUp(toks[j]) == "THEN") { j = j + 1; continue; }
+            cond = cond + condToken(toks[j], vars) + " ";
+            j = j + 1;
+        }
+        return [j, ind + "if (" + cond.trim() + ") \{\n"];
+    }
+    if (kw == "ELSE") { return [pos + 1, ind + "\} else \{\n"]; }
+    if (kw == "END-IF") { return [pos + 1, ind + "\}\n"]; }
+
+    if (kw == "PERFORM") {
+        let target = tkVal(toks[pos + 1]);
+        let j = pos + 2;
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        return [j, ind + szName(target) + "_();\n"];
+    }
+
+    if (kw == "STOP") {
+        // STOP RUN
+        let j = pos + 1;
+        if (j < n && tkType(toks[j]) == "W") { j = j + 1; }
+        if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == ".") { j = j + 1; }
+        return [j, ind + "// STOP RUN\n"];
+    }
+
+    // unknown keyword: skip to next '.'
+    let j = pos + 1;
+    while (j < n && !(tkType(toks[j]) == "O" && tkVal(toks[j]) == ".")) { j = j + 1; }
+    return [j + 1, ind + "// unsupported: " + tkVal(t) + "\n"];
+}
+
+// Wrap a numeric literal so it is an exact dec when assigned to a dec field.
+fn string decify(string operandText) {
+    // operandText is already translated; if it's a plain integer/decimal literal,
+    // append nothing for names; for bare numbers, dec context handles via setScale.
+    return operandText;
+}
+
+// Emit an arithmetic assignment with dec scaling when the destination is dec.
+fn string applyArith(string dst, string dstName, string rawExpr, [string] vars, string ind) {
+    let kind = varKind(vars, dstName);
+    if (kind == "dec") {
+        let sc = varScale(vars, dstName);
+        return ind + dst + " = (" + rawExpr + ").setScale(" + sc + ", \"down\");\n";
+    }
+    return ind + dst + " = (" + rawExpr + ");\n";
+}
+
+// Translate one token inside an IF condition (maps =, AND, OR, NOT).
+fn string condToken(string t, [string] vars) {
+    if (tkType(t) == "W") {
+        let u = tkUp(t);
+        if (u == "AND") { return "&&"; }
+        if (u == "OR")  { return "||"; }
+        if (u == "NOT") { return "!"; }
+        if (u == "ZERO" || u == "ZEROS" || u == "ZEROES") { return "0"; }
+    }
+    return operand(vars, t);
+}
+
+// ── 7. TOP-LEVEL TRANSLATE ────────────────────────────────────────────────────
+fn string translate(string src) {
+    let clean = src.replaceAll("\r", "");
+    let lines = clean.split("\n");
+    let toks = tokenizeAll(lines);
+    let vars = collectVars(toks);
+    let header = "// Generated by serez-cobol from COBOL source.\n\n";
+    return header + emitVars(vars) + emitProcedure(toks, vars);
+}
+
+// ── 8. CLI DRIVER ─────────────────────────────────────────────────────────────
+let args = Env.args();
+let inFile = "";
+for (let a in args) {
+    let low = a.toLowerCase();
+    if (low.endsWith(".cob") || low.endsWith(".cbl")) { inFile = a; }
+}
+if (inFile == "") {
+    out "serez-cobol — COBOL → Serez (.sz) translator";
+    out "usage: sz cobol.sz <input.cob>";
+} else {
+    let src = File.read(inFile);
+    let result = translate(src);
+    let base = inFile.substring(0, inFile.length() - 4);
+    let outFile = base + ".sz";
+    File.write(outFile, result);
+    out "translated " + inFile + " -> " + outFile;
+}

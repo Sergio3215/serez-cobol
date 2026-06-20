@@ -1,0 +1,10 @@
+{
+  "name": "serez-cobol",
+  "version": "0.1.0",
+  "description": "COBOL → Serez (.sz) source-to-source translator, written in pure .sz.",
+  "permissions": ["File", "Env"],
+  "scripts": {
+    "translate": "echo usage: sz cobol.sz <input.cob>",
+    "test": "pwsh -File tests/run_tests.ps1"
+  }
+}
