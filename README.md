@@ -38,7 +38,7 @@ sz examples/invoice.sz                # run the translated program
 `serezTransform.sz` is the front-end dispatcher (`toSerez` works today; `toCobol`,
 the reverse direction, is reserved for a future release).
 
-## Supported (v1.0)
+## Supported (v2.0)
 
 **Divisions & layout**
 - IDENTIFICATION / ENVIRONMENT (FILE-CONTROL) / DATA / PROCEDURE.
@@ -49,16 +49,20 @@ the reverse direction, is reserved for a future release).
 **Data (WORKING-STORAGE, FILE SECTION, LINKAGE)**
 - `PIC 9(n)` → `int` · `9(n)V9(m)` / `S9..V..` → exact `dec` · `X(n)`/`A(n)` → `string`.
 - Numeric-edited PICs (`Z`, `,`, `.`, `$`, `*`) → formatted on assignment.
-- `VALUE`, `ZERO`/`SPACE`; level **88** condition names; group items (organizational);
-  `OCCURS n TIMES` tables with subscripts `T(i)`.
+- `VALUE`, `ZERO`/`SPACE`; level **77** items and level **88** condition names;
+  group items (organizational); `OCCURS n TIMES` tables with subscripts `T(i)`.
 
 **Procedure**
-- `DISPLAY`, `MOVE`, `ACCEPT`, `INITIALIZE`, `CONTINUE`, `STOP RUN` (→ real exit).
-- `COMPUTE [ROUNDED]`; `ADD`/`SUBTRACT`/`MULTIPLY`/`DIVIDE` with `TO/FROM/BY/INTO/GIVING [ROUNDED]`.
-- `IF / ELSE / END-IF`; `EVALUATE … WHEN … WHEN OTHER … END-EVALUATE`
+- `DISPLAY` (incl. `WITH NO ADVANCING`, parsed), `MOVE`, `ACCEPT`, `INITIALIZE`,
+  `SET` (`88 TO TRUE`, index `TO`/`UP BY`/`DOWN BY`), `CONTINUE`,
+  `STOP RUN` / `GOBACK` / `EXIT PROGRAM` (→ real exit).
+- `COMPUTE [ROUNDED]` (incl. `**` and several receivers `COMPUTE a b = …`);
+  `ADD`/`SUBTRACT`/`MULTIPLY`/`DIVIDE` with `TO/FROM/BY/INTO/GIVING [ROUNDED]`,
+  `DIVIDE … REMAINDER`, and **multiple receivers** (`ADD 1 TO a b c`).
+- `IF / ELSE / END-IF`; `EVALUATE … WHEN [v | v THRU w | a WHEN b] … WHEN OTHER …`
   (subject value, or `EVALUATE TRUE`).
-- `PERFORM <para> [THRU <para2>]`, `… N TIMES | UNTIL c | VARYING v FROM a BY b UNTIL c`,
-  and inline `PERFORM … END-PERFORM`; paragraphs → functions.
+- `PERFORM <para> [THRU <para2>]`, `… <n|var> TIMES | UNTIL c | VARYING v FROM a BY b
+  UNTIL c [AFTER w FROM … UNTIL …]`, and inline `PERFORM … END-PERFORM`.
 - `GO TO <para>` (forward skip and backward loops) — paragraphs run under a
   program-counter driver, so `GO TO`, fall-through and `STOP RUN` all behave like
   COBOL. (`GO TO … DEPENDING ON` and `GO TO` inside a PERFORMed paragraph: not yet.)
@@ -66,8 +70,10 @@ the reverse direction, is reserved for a future release).
 - Files (LINE SEQUENTIAL): `SELECT…ASSIGN`, `FD`, `OPEN`, `READ … AT END / NOT AT END … END-READ`,
   `WRITE [FROM]`, `CLOSE`.
 
-**Conditions** — `= > < >= <=`, `GREATER`/`LESS`/`EQUAL [THAN/TO]`, `AND`/`OR`, 88-names.
-`=` → `==`; COBOL names (`WS-TOTAL`) → valid `.sz` names (`WS_TOTAL`).
+**Conditions** — `= > < >= <=`, `GREATER`/`LESS`/`EQUAL [THAN/TO]`, `AND`/`OR`,
+`NOT` (negated operator, group, or relation), abbreviated/implied subject
+(`IF X = 1 OR 2 OR 3`), class tests (`IS [NOT] NUMERIC` / `ALPHABETIC[-UPPER|-LOWER]`),
+and 88-names. `=` → `==`; COBOL names (`WS-TOTAL`) → valid `.sz` names (`WS_TOTAL`).
 
 ### Worked example
 
@@ -87,6 +93,8 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 
 - `CALL` / nested programs (emitted as a comment — external subprograms can't be
   auto-linked); `GO TO … DEPENDING ON`; `ALTER`.
+- `DISPLAY … WITH NO ADVANCING` is parsed but still prints a trailing newline
+  (the core has no no-newline print without a Terminal permission).
 - `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
 - `SORT`/`MERGE`, report writer, screen section; `ARITH(EXTEND)` 31-digit math
   (`dec` covers 28–29 digits; larger is detected, not supported).
@@ -105,7 +113,9 @@ sz tests/run_tests.sz generate   # regenerate golden .expected files
 The runner is pure `.sz` (uses `OS.exec` to drive `sz` on each example).
 
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
-its output compared against `examples/<name>.expected` (11 end-to-end cases).
+its output compared against `examples/<name>.expected` (15 end-to-end cases —
+including `features.cob`, a showcase of the v2.0 control-flow/condition features,
+and `batch.cob`, a file write→read→total→format integration).
 
 ## Layout
 

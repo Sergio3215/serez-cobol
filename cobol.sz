@@ -959,15 +959,20 @@ fn string emitProcedure([string] toks, [string] vars) {
                 i = res[0];
                 continue;
             }
-            if (tkType(nx) == "N") {
-                // PERFORM <n> TIMES … END-PERFORM
-                let cnt = "__p" + i;
-                curBody = curBody + ind + "let " + cnt + " = 0;\n";
-                curBody = curBody + ind + "while (" + cnt + " < " + tkVal(nx) + ") " + r"{" + "\n";
-                closeStack.push(ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "" + r"}" + "\n");
-                evalSubj.push(""); evalSeen.push("");
-                i = i + 3; // n TIMES
-                continue;
+            // PERFORM <count> TIMES … END-PERFORM  (count = literal or variable)
+            if (tkType(nx) == "N" || (tkType(nx) == "W" && i + 2 < n && isWord(toks[i + 2], "TIMES"))) {
+                let rr = emitRef(toks, i + 1, vars);
+                if (rr[0] < n && isWord(toks[rr[0]], "TIMES")) {
+                    let cnt = "__p" + i;
+                    let lim = "__n" + i;
+                    curBody = curBody + ind + "let " + lim + " = " + rr[1] + ";\n";
+                    curBody = curBody + ind + "let " + cnt + " = 0;\n";
+                    curBody = curBody + ind + "while (" + cnt + " < " + lim + ") " + r"{" + "\n";
+                    closeStack.push(ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "" + r"}" + "\n");
+                    evalSubj.push(""); evalSeen.push("");
+                    i = rr[0] + 1; // past TIMES
+                    continue;
+                }
             }
             // out-of-line PERFORM <para> [...]
             let r = emitStmt(toks, i, vars, ind, paras);
@@ -1135,9 +1140,16 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
             j = r[0];
         }
         let code = "";
+        let src = expr.trim();
+        // multiple receivers: evaluate the expression once into a temp, COBOL-style
+        if (dstLhs.length() > 1) {
+            let tmp = "__c" + pos;
+            code = ind + "let " + tmp + " = " + src + ";\n";
+            src = tmp;
+        }
         let k = 0;
         while (k < dstLhs.length()) {
-            code = code + assignExpr(vars, dstBase[k], dstLhs[k], expr.trim(), rounded, ind);
+            code = code + assignExpr(vars, dstBase[k], dstLhs[k], src, rounded, ind);
             k = k + 1;
         }
         return [j, code];
@@ -1321,13 +1333,14 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
             let res = emitVarying(toks, j + 1, vars, ind);
             return [res[0], res[1] + bodyOnce + res[2]];
         }
-        // <count> TIMES — count may be a literal or a variable
+        // <count> TIMES — count may be a literal or a variable (snapshot once)
         if (j < n && (tkType(toks[j]) == "N" || tkType(toks[j]) == "W")) {
             let rr = emitRef(toks, j, vars);
             if (rr[0] < n && isWord(toks[rr[0]], "TIMES")) {
                 let cnt = "__p" + pos;
-                let times = rr[1];
-                let body = ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + times + ") " + r"{" + "\n";
+                let lim = "__n" + pos;
+                let body = ind + "let " + lim + " = " + rr[1] + ";\n";
+                body = body + ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + lim + ") " + r"{" + "\n";
                 body = body + bodyOnce + inner + cnt + " = " + cnt + " + 1;\n" + ind + r"}" + "\n";
                 return [rr[0] + 1, body];
             }

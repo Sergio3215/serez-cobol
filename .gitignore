@@ -3,3 +3,5 @@ examples/*.sz
 # Scratch / temp probes
 *~*.sz
 ~*
+# Data files produced by file-I/O examples
+*.dat
