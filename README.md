@@ -114,6 +114,6 @@ tests/run_tests.ps1  end-to-end test runner
 5. **Emitter** — working-storage globals, one `fn` per paragraph, a main section
    calling the non-PERFORMed paragraphs in order.
 
-> Note on the source: strings the translator emits that contain `{`/`}` are
-> written `\{`/`\}` to avoid serez string interpolation; helper variables avoid
-> the reserved names `out`/`dec`.
+> Note on the source: braces the translator emits into generated code use
+> raw-string literals (`r"{"`, `r"}"`) to avoid serez string interpolation;
+> helper variables avoid the reserved names `out`/`dec`.

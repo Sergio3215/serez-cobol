@@ -12,6 +12,7 @@ $examples = Join-Path $root "examples"
 
 # Locate the sz interpreter (release build of the core).
 $candidates = @(
+    "C:\Program Files\Serez-Code\bin\sz.exe",
     "E:\01 Proyectos\Propio\Serez-code\target\release\sz.exe",
     "E:\01 Proyectos\Propio\Serez-code\target\debug\sz.exe"
 )

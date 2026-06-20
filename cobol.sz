@@ -640,7 +640,7 @@ fn string emitProcedure([string] toks, [string] vars) {
         if (depth == 0 && tkType(t) == "W" && !isStmtKw(t) && i + 1 < n && isDot(toks[i + 1])) {
             if (curName == "") { mainCalls = mainCalls + curBody; }
             else {
-                funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
+                funcs = funcs + "fn " + szName(curName) + "_() " + r"{" + "\n" + curBody + "" + r"}" + "\n\n";
                 paraOrder = paraOrder + szName(curName) + "|";
             }
             curName = tkVal(t);
@@ -666,15 +666,15 @@ fn string emitProcedure([string] toks, [string] vars) {
 
         if (kw == "IF") {
             let r = grabCond(toks, i + 1, vars, "");
-            curBody = curBody + ind + "if (" + r[1] + ") \{\n";
-            closeStack.push(ind + "\}\n");
+            curBody = curBody + ind + "if (" + r[1] + ") " + r"{" + "\n";
+            closeStack.push(ind + "" + r"}" + "\n");
             evalSubj.push("");
             evalSeen.push("");
             i = r[0];
             continue;
         }
         if (kw == "ELSE") {
-            curBody = curBody + ind + "\} else \{\n";
+            curBody = curBody + ind + "" + r"}" + " else " + r"{" + "\n";
             i = i + 1;
             continue;
         }
@@ -705,7 +705,7 @@ fn string emitProcedure([string] toks, [string] vars) {
             curBody = curBody + ind + "let " + ev + " = (" + f + "_idx >= " + f + "_lines.length());\n";
             let take = rec + " = " + f + "_lines[" + f + "_idx]; " + f + "_idx = " + f + "_idx + 1;";
             if (intoV != "") { take = take + " " + intoV + " = " + rec + ";"; }
-            curBody = curBody + ind + "if (!" + ev + ") \{ " + take + " \}\n";
+            curBody = curBody + ind + "if (!" + ev + ") " + r"{" + " " + take + " " + r"}" + "\n";
             i = j;
             continue;
         }
@@ -714,16 +714,16 @@ fn string emitProcedure([string] toks, [string] vars) {
         if (kw == "AT" && i + 1 < n && isWord(toks[i + 1], "END")) {
             if (topIsClause) { curBody = curBody + closeStack.pop(); evalSubj.pop(); evalSeen.pop(); }
             let ind2 = indentOf(closeStack.length() + 1);
-            curBody = curBody + ind2 + "if (" + curEof + ") \{\n";
-            closeStack.push(ind2 + "\}\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
+            curBody = curBody + ind2 + "if (" + curEof + ") " + r"{" + "\n";
+            closeStack.push(ind2 + "" + r"}" + "\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
             i = i + 2;
             continue;
         }
         if (kw == "NOT" && i + 1 < n && isWord(toks[i + 1], "AT")) {
             if (topIsClause) { curBody = curBody + closeStack.pop(); evalSubj.pop(); evalSeen.pop(); }
             let ind2 = indentOf(closeStack.length() + 1);
-            curBody = curBody + ind2 + "if (!" + curEof + ") \{\n";
-            closeStack.push(ind2 + "\}\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
+            curBody = curBody + ind2 + "if (!" + curEof + ") " + r"{" + "\n";
+            closeStack.push(ind2 + "" + r"}" + "\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
             i = i + 3; // NOT AT END
             continue;
         }
@@ -733,7 +733,7 @@ fn string emitProcedure([string] toks, [string] vars) {
             let subj = "";
             if (isWord(toks[i + 1], "TRUE")) { subj = "TRUE"; i = i + 2; }
             else { let r = grabExpr(toks, i + 1, vars, ""); subj = r[1]; i = r[0]; }
-            closeStack.push(ind + "\}\n");
+            closeStack.push(ind + "" + r"}" + "\n");
             evalSubj.push(subj);
             evalSeen.push("");
             continue;
@@ -745,17 +745,17 @@ fn string emitProcedure([string] toks, [string] vars) {
             let lead = "} else if";
             if (seen == "") { lead = "if"; evalSeen[top] = "1"; }
             if (isWord(toks[i + 1], "OTHER")) {
-                curBody = curBody + ind + "\} else \{\n";
+                curBody = curBody + ind + "" + r"}" + " else " + r"{" + "\n";
                 i = i + 2;
                 continue;
             }
             if (subj == "TRUE") {
                 let r = grabCond(toks, i + 1, vars, "");
-                curBody = curBody + ind + lead + " (" + r[1] + ") \{\n";
+                curBody = curBody + ind + lead + " (" + r[1] + ") " + r"{" + "\n";
                 i = r[0];
             } else {
                 let r = grabExpr(toks, i + 1, vars, "");
-                curBody = curBody + ind + lead + " (" + subj + " == " + r[1] + ") \{\n";
+                curBody = curBody + ind + lead + " (" + subj + " == " + r[1] + ") " + r"{" + "\n";
                 i = r[0];
             }
             continue;
@@ -766,8 +766,8 @@ fn string emitProcedure([string] toks, [string] vars) {
             let nx = toks[i + 1];
             if (isWord(nx, "UNTIL")) {
                 let r = grabCond(toks, i + 2, vars, "");
-                curBody = curBody + ind + "while (!(" + r[1] + ")) \{\n";
-                closeStack.push(ind + "\}\n"); evalSubj.push(""); evalSeen.push("");
+                curBody = curBody + ind + "while (!(" + r[1] + ")) " + r"{" + "\n";
+                closeStack.push(ind + "" + r"}" + "\n"); evalSubj.push(""); evalSeen.push("");
                 i = r[0];
                 continue;
             }
@@ -782,8 +782,8 @@ fn string emitProcedure([string] toks, [string] vars) {
                 // PERFORM <n> TIMES … END-PERFORM
                 let cnt = "__p" + i;
                 curBody = curBody + ind + "let " + cnt + " = 0;\n";
-                curBody = curBody + ind + "while (" + cnt + " < " + tkVal(nx) + ") \{\n";
-                closeStack.push(ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "\}\n");
+                curBody = curBody + ind + "while (" + cnt + " < " + tkVal(nx) + ") " + r"{" + "\n";
+                closeStack.push(ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "" + r"}" + "\n");
                 evalSubj.push(""); evalSeen.push("");
                 i = i + 3; // n TIMES
                 continue;
@@ -803,7 +803,7 @@ fn string emitProcedure([string] toks, [string] vars) {
 
     if (curName == "") { mainCalls = mainCalls + curBody; }
     else {
-        funcs = funcs + "fn " + szName(curName) + "_() \{\n" + curBody + "\}\n\n";
+        funcs = funcs + "fn " + szName(curName) + "_() " + r"{" + "\n" + curBody + "" + r"}" + "\n\n";
         paraOrder = paraOrder + szName(curName) + "|";
     }
 
@@ -833,8 +833,8 @@ fn [any] emitVarying([string] toks, int pos, [string] vars, string ind) {
     let rc = grabCond(toks, j, vars, "");
     let cond = rc[1];
     j = rc[0];
-    let header = ind + v + " = " + from + ";\n" + ind + "while (!(" + cond + ")) \{\n";
-    let close = ind + "    " + v + " = " + v + " + " + by + ";\n" + ind + "\}\n";
+    let header = ind + v + " = " + from + ";\n" + ind + "while (!(" + cond + ")) " + r"{" + "\n";
+    let close = ind + "    " + v + " = " + v + " + " + by + ";\n" + ind + "" + r"}" + "\n";
     return [j, header, close];
 }
 
@@ -1003,7 +1003,7 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         let j = pos + 2;
         if (j < n && isWord(toks[j], "UNTIL")) {
             let r = grabCond(toks, j + 1, vars, "");
-            return [r[0], ind + "while (!(" + r[1] + ")) \{\n" + ind + "    " + para + "_();\n" + ind + "\}\n"];
+            return [r[0], ind + "while (!(" + r[1] + ")) " + r"{" + "\n" + ind + "    " + para + "_();\n" + ind + "" + r"}" + "\n"];
         }
         if (j < n && isWord(toks[j], "VARYING")) {
             let res = emitVarying(toks, j + 1, vars, ind);
@@ -1015,8 +1015,8 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
             let times = tkVal(toks[j]);
             j = j + 1;
             if (j < n && isWord(toks[j], "TIMES")) { j = j + 1; }
-            let body = ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + times + ") \{\n";
-            body = body + ind + "    " + para + "_();\n" + ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "\}\n";
+            let body = ind + "let " + cnt + " = 0;\n" + ind + "while (" + cnt + " < " + times + ") " + r"{" + "\n";
+            body = body + ind + "    " + para + "_();\n" + ind + "    " + cnt + " = " + cnt + " + 1;\n" + ind + "" + r"}" + "\n";
             return [j, body];
         }
         return [j, ind + para + "_();\n"];
@@ -1192,7 +1192,7 @@ fn string translate(string src, string rtText) {
     let files = collectFiles(toks);
     for (let e in files) { vars.push(e); }
     let header = "// Generated by serez-cobol from COBOL source.\n\n";
-    if (files.length() > 0) { header = header + "use permissions \{ File \}\n\n"; }
+    if (files.length() > 0) { header = header + "use permissions " + r"{" + " File " + r"}" + "\n\n"; }
     let rt = "";
     if (anyEdited(vars) && rtText != "") { rt = rtText + "\n"; }
     return header + rt + emitVars(vars) + emitProcedure(toks, vars);
