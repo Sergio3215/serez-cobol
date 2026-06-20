@@ -115,8 +115,8 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 - `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
 - `SORT`/`MERGE`, report writer, screen section; `ARITH(EXTEND)` 31-digit math
   (`dec` covers 28–29 digits; larger is detected, not supported).
-- Group-level `MOVE`/`DISPLAY` (use elementary items); numeric interpretation of
-  raw record fields on `READ` (records arrive as strings).
+- Group-level `MOVE`/`DISPLAY` (use elementary items). (Note: a `MOVE` of an
+  alphanumeric field into a numeric one *is* converted, via `parseInt`/`Dec.parse`.)
 - Reverse direction (`serez.sz`): the round-trip is **behavioral**, not byte-for-
   byte (idioms differ: `ADD`↔`COMPUTE`, `EVALUATE`↔nested `IF`, spacing).
 
@@ -131,10 +131,14 @@ sz tests/run_roundtrip.sz        # COBOL→sz→COBOL→sz, check behavior prese
 The runners are pure `.sz` (they use `OS.exec` to drive `sz` on each example).
 
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
-its output compared against `examples/<name>.expected` (15 end-to-end cases —
-including `features.cob`, a showcase of the v2.0 control-flow/condition features,
-and `batch.cob`, a file write→read→total→format integration). `run_roundtrip.sz`
-additionally verifies all 15 survive a full COBOL→sz→COBOL→sz cycle unchanged.
+its output compared against `examples/<name>.expected` (17 end-to-end cases).
+Highlights: `features.cob` (v2.0 control-flow/condition showcase), `batch.cob`
+(file write→read→total→format), and two whole-program integration tests —
+`inventory.cob` (tables + dec + file I/O + STRING + EVALUATE ranges + 2-D PERFORM
+VARYING…AFTER + class test + PIC editing) and `parser.cob` (UNSTRING + numeric
+conversion + DIVIDE REMAINDER + `**` + INSPECT + ref-mod + GO TO + implied
+subject + SET). `run_roundtrip.sz` verifies all 17 survive a full
+COBOL→sz→COBOL→sz cycle with identical behavior.
 
 ## Layout
 

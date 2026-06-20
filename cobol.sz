@@ -1110,12 +1110,20 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
         let rs = emitRef(toks, pos + 1, vars);
         let src = rs[1];
         let j = rs[0];
+        // MOVE of an alphanumeric field into a numeric one converts (COBOL).
+        let srcIsStr = tkType(toks[pos + 1]) == "W" && varKind(vars, tkVal(toks[pos + 1])) == "string";
         if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
         // MOVE x TO a b c  — assign to every destination
         let code = "";
         while (j < n && !isTargetEnd(toks[j])) {
             let rl = emitLhs(toks, j, vars);
-            code = code + assign(vars, rl[2], rl[1], src, ind);
+            let s2 = src;
+            if (srcIsStr) {
+                let tk = varKind(vars, rl[2]);
+                if (tk == "int") { s2 = "parseInt(" + src + ")"; }
+                else if (tk == "dec") { s2 = "Dec.parse(" + src + ")"; }
+            }
+            code = code + assign(vars, rl[2], rl[1], s2, ind);
             j = rl[0];
         }
         return [j, code];

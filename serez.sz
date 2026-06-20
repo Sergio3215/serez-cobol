@@ -90,6 +90,9 @@ fn string unwrap(string e) {
 //   fmtPic(EXPR, "MASK")             → EXPR
 fn string stripWrappers(string e) {
     let s = e.trim();
+    // numeric coercions cobol.sz adds for MOVE alphanumeric → numeric
+    if (s.startsWith("parseInt(")) { return stripWrappers(unwrap(s.substring(9, s.length() - 1))); }
+    if (s.startsWith("Dec.parse(")) { return stripWrappers(unwrap(s.substring(10, s.length() - 1))); }
     if (s.startsWith("fmtPic(")) {
         let inner = s.substring(7, s.length() - 1);
         let parts = splitTop(inner, ",");
