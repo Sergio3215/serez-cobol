@@ -19,24 +19,41 @@ WS_TAX = ((WS_SUBTOTAL * 0.21m) + 0m).setScale(2, "half-up");
 
 ## Usage
 
+`index.sz` is the single entry point. It decides the direction from the input
+file extension — there are no sub-commands:
+
 ```sh
-# simplest — auto-detect direction by extension:
-sz index.sz examples/invoice.cob      # .cob/.cbl → COBOL→.sz ; .sz → .sz→COBOL (planned)
-                                       # anything else → a clear error
-
-# explicit command:
-sz serezTransform.sz toSerez examples/invoice.cob   # COBOL → .sz
-sz serezTransform.sz toCobol examples/invoice.sz    # .sz → COBOL  (planned)
-
-# direct engine:
-sz cobol.sz examples/invoice.cob      # writes examples/invoice.sz
-sz examples/invoice.sz                # run the translated program
+sz index.sz program.cob       # .cob/.cbl → COBOL → Serez (.sz)     [cobol.sz]
+sz index.sz program.sz        # .sz       → Serez → COBOL (.cob)     [serez.sz]
+sz index.sz notes.txt         # anything else → a clear error
 ```
 
-`cobol.sz` needs the `File` and `Env` permissions (in `serez.json` / via
-`use permissions { File, Env }`). It auto-detects free- or fixed-format source.
-`serezTransform.sz` is the front-end dispatcher (`toSerez` works today; `toCobol`,
-the reverse direction, is reserved for a future release).
+You can also run the engines directly:
+
+```sh
+sz cobol.sz examples/invoice.cob      # writes examples/invoice.sz
+sz examples/invoice.sz                # run the translated program
+sz serez.sz program.sz                # writes program.cob
+```
+
+`cobol.sz` auto-detects free- or fixed-format source and needs `File`/`Env`
+permissions (`serez.json`). Both directions are pure `.sz`.
+
+### Reverse direction (.sz → COBOL)
+
+Because the `.sz` cannot represent COBOL-only structure (the exact PICTURE, level
+numbers, sections), `cobol.sz` embeds the IDENTIFICATION / ENVIRONMENT / DATA
+divisions as `//@` comment annotations in the generated `.sz` — a source map.
+They are ignored when the `.sz` runs (and don't affect any golden). `serez.sz`
+reconstructs those divisions from the annotations and genuinely translates the
+PROCEDURE back (DISPLAY/MOVE/COMPUTE, IF/EVALUATE→nested IF, PERFORM forms,
+GO TO, conditions incl. class tests, subscripts).
+
+A COBOL→.sz→COBOL→.sz round-trip therefore preserves **behavior** (same output),
+though not byte-identical text (e.g. `ADD 1 TO X` comes back as `COMPUTE X = X + 1`;
+an `EVALUATE` comes back as nested `IF`s). `tests/run_roundtrip.sz` checks this on
+13 examples. Not yet reversed to COBOL verbs: `STRING`/`UNSTRING`/`INSPECT`/
+reference-modification and file I/O (they lower to Serez string/file methods).
 
 ## Supported (v2.0)
 
@@ -100,17 +117,19 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
   (`dec` covers 28–29 digits; larger is detected, not supported).
 - Group-level `MOVE`/`DISPLAY` (use elementary items); numeric interpretation of
   raw record fields on `READ` (records arrive as strings).
-- **`toCobol`** — the reverse direction (Serez `.sz` → COBOL). Reserved as the
-  next major objective; `serezTransform.sz` already exposes the command.
+- Reverse direction (`serez.sz`): `STRING`/`UNSTRING`/`INSPECT`/reference-
+  modification and file I/O do not yet translate back to COBOL verbs (they lower
+  to Serez string/file methods). Everything else round-trips behaviorally.
 
 ## Tests
 
 ```sh
 sz tests/run_tests.sz            # translate + run + diff vs golden
 sz tests/run_tests.sz generate   # regenerate golden .expected files
+sz tests/run_roundtrip.sz        # COBOL→sz→COBOL→sz, check behavior preserved
 ```
 
-The runner is pure `.sz` (uses `OS.exec` to drive `sz` on each example).
+The runners are pure `.sz` (they use `OS.exec` to drive `sz` on each example).
 
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
 its output compared against `examples/<name>.expected` (15 end-to-end cases —
@@ -120,13 +139,14 @@ and `batch.cob`, a file write→read→total→format integration).
 ## Layout
 
 ```
-index.sz             auto-detecting entry point (routes by file extension)
-serezTransform.sz    unified CLI dispatcher (toSerez / toCobol)
-cobol.sz             the COBOL→sz engine (lexer + parser + emitter + COPY + CLI)
-runtime/cobol_rt.sz  PIC-editing runtime, prepended when edited fields are used
+index.sz             single entry point (routes by file extension)
+cobol.sz             the COBOL→sz engine (lexer + parser + emitter + COPY)
+serez.sz             the sz→COBOL engine (reverse; reads //@ annotations)
+runtime/cobol_rt.sz  PIC-editing + class-test runtime, prepended when needed
 examples/*.cob       sample COBOL programs        (*.cpy copybooks)
 examples/*.expected  golden output of translated programs
-tests/run_tests.sz   end-to-end test runner (pure .sz)
+tests/run_tests.sz       end-to-end test runner (pure .sz)
+tests/run_roundtrip.sz   COBOL→sz→COBOL behavior round-trip test (pure .sz)
 ```
 
 ## Architecture

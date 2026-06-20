@@ -1,15 +1,17 @@
-// index — auto-detecting entry point for serez-cobol.
-// Picks the translation direction from the input file extension and delegates
-// to serezTransform.sz:
-//   *.cob / *.cbl  → toSerez (COBOL → Serez .sz)
-//   *.sz           → toCobol (Serez .sz → COBOL)   [planned]
-//   anything else  → error
+// index — the single entry point for serez-cobol.
+// Decides the direction purely from the input file extension and runs the
+// matching engine. There are no sub-commands: just `sz index.sz <file>`.
 //
-//   sz index.sz <file>      # run from the repo root
+//   <file>.cob / .cbl  → cobol.sz   (COBOL → Serez .sz)
+//   <file>.sz          → serez.sz   (Serez .sz → COBOL)
+//   anything else      → error
+//
+//   sz index.sz path/to/program.cob
+//   sz index.sz path/to/program.sz
 
 use permissions { OS, Env, File }
 
-// the input is the first argument after this script
+// the input file is the first argument after this script
 let file = "";
 let past = false;
 for (let a in Env.args()) {
@@ -21,19 +23,18 @@ for (let a in Env.args()) {
 }
 
 let low = file.toLowerCase();
-let cmd = "";
-if (low.endsWith(".cob") || low.endsWith(".cbl")) { cmd = "toSerez"; }
-else if (low.endsWith(".sz")) { cmd = "toCobol"; }
+let engine = "";
+if (low.endsWith(".cob") || low.endsWith(".cbl")) { engine = "cobol.sz"; }
+else if (low.endsWith(".sz")) { engine = "serez.sz"; }
 
 if (file == "") {
-    out "index — serez-cobol auto dispatcher";
     out "usage: sz index.sz <file.cob | file.sz>";
-} else if (cmd == "") {
+} else if (engine == "") {
     out "ERROR: '" + file + "' is not a COBOL or Serez source.";
-    out "Expected a .cob/.cbl (COBOL) or .sz (Serez) file.";
+    out "Pass a .cob/.cbl (COBOL) file to translate to Serez, or a .sz file to translate to COBOL.";
 } else {
     let r = null;
-    unsafe { r = OS.exec("sz", ["serezTransform.sz", cmd, file]); }
+    unsafe { r = OS.exec("sz", [engine, file]); }
     let so = r.stdout.trim();
     let se = r.stderr.trim();
     if (so != "") { out so; }

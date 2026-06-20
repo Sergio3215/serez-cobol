@@ -1,0 +1,408 @@
+// serez.sz — the reverse engine: Serez (.sz) → COBOL.
+//
+// Counterpart of cobol.sz. Reconstructs the IDENTIFICATION / ENVIRONMENT / DATA
+// divisions from the `//@` annotation comments that cobol.sz embeds (the exact
+// PICs, level numbers and sections cannot be recovered from .sz alone), and
+// genuinely translates the PROCEDURE back from the .sz statements.
+//
+//   sz serez.sz program.sz        # writes program.cob next to it
+//
+// Invoked by index.sz for any .sz input.
+
+use permissions { File, Env }
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+fn string cobName(string s) { return s.replaceAll("_", "-"); }
+
+fn bool startsTrim(string line, string p) { return line.trim().startsWith(p); }
+
+// split a serez expression on top-level '+' (respecting parens and strings)
+fn [string] splitPlus(string e) {
+    let parts = [];
+    let cur = "";
+    let depth = 0;
+    let inStr = false;
+    let i = 0;
+    while (i < e.length()) {
+        let c = e[i];
+        if (inStr) {
+            cur = cur + c;
+            if (c == "\"") { inStr = false; }
+        } else if (c == "\"") {
+            cur = cur + c; inStr = true;
+        } else if (c == "(") {
+            depth = depth + 1; cur = cur + c;
+        } else if (c == ")") {
+            depth = depth - 1; cur = cur + c;
+        } else if (c == "+" && depth == 0) {
+            parts.push(cur.trim()); cur = "";
+        } else {
+            cur = cur + c;
+        }
+        i = i + 1;
+    }
+    if (cur.trim() != "") { parts.push(cur.trim()); }
+    return parts;
+}
+
+// strip one layer of surrounding parentheses if they wrap the whole string
+fn string unwrap(string e) {
+    let s = e.trim();
+    while (s.startsWith("(") && s.endsWith(")")) {
+        // verify the first '(' matches the last ')'
+        let depth = 0;
+        let ok = true;
+        let i = 0;
+        while (i < s.length()) {
+            let c = s[i];
+            if (c == "(") { depth = depth + 1; }
+            else if (c == ")") { depth = depth - 1; if (depth == 0 && i < s.length() - 1) { ok = false; } }
+            i = i + 1;
+        }
+        if (!ok) { return s; }
+        s = s.substring(1, s.length() - 1).trim();
+    }
+    return s;
+}
+
+// remove the dec / fmtPic wrappers cobol.sz adds around arithmetic sources:
+//   ((EXPR) + 0m).setScale(n, "..")  → EXPR
+//   fmtPic(EXPR, "MASK")             → EXPR
+fn string stripWrappers(string e) {
+    let s = e.trim();
+    if (s.startsWith("fmtPic(")) {
+        let inner = s.substring(7, s.length() - 1);
+        let parts = splitTop(inner, ",");
+        if (parts.length() >= 1) { return stripWrappers(parts[0]); }
+    }
+    let sc = s.indexOf(").setScale(");
+    if (sc >= 0 && s.startsWith("(")) {
+        let body = s.substring(1, sc);            // "(EXPR) + 0m"
+        let plus = body.lastIndexOf("+ 0m");
+        if (plus >= 0) { body = body.substring(0, plus); }
+        return stripWrappers(unwrap(body.trim()));
+    }
+    return s;
+}
+
+// split on a separator at top level (parens/strings aware)
+fn [string] splitTop(string e, string sep) {
+    let parts = [];
+    let cur = "";
+    let depth = 0;
+    let inStr = false;
+    let i = 0;
+    while (i < e.length()) {
+        let c = e[i];
+        if (inStr) { cur = cur + c; if (c == "\"") { inStr = false; } }
+        else if (c == "\"") { cur = cur + c; inStr = true; }
+        else if (c == "(") { depth = depth + 1; cur = cur + c; }
+        else if (c == ")") { depth = depth - 1; cur = cur + c; }
+        else if (c == sep && depth == 0) { parts.push(cur.trim()); cur = ""; }
+        else { cur = cur + c; }
+        i = i + 1;
+    }
+    if (cur.trim() != "") { parts.push(cur.trim()); }
+    return parts;
+}
+
+// convert serez identifiers in a fragment to COBOL names (WS_X → WS-X),
+// leaving string literals and numbers untouched.
+fn string revTokens(string e) {
+    let out2 = "";
+    let i = 0;
+    let n = e.length();
+    let inStr = false;
+    while (i < n) {
+        let c = e[i];
+        if (inStr) { out2 = out2 + c; if (c == "\"") { inStr = false; } i = i + 1; continue; }
+        if (c == "\"") { inStr = true; out2 = out2 + c; i = i + 1; continue; }
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_".includes(c)) {
+            let w = "";
+            while (i < n && "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".includes(e[i])) { w = w + e[i]; i = i + 1; }
+            out2 = out2 + cobName(w);
+        } else {
+            out2 = out2 + c; i = i + 1;
+        }
+    }
+    return out2;
+}
+
+// subscripts: NAME[(EXPR) - 1] → NAME(EXPR)   (0-indexed .sz back to 1-indexed COBOL)
+fn string revSub(string e) {
+    let out2 = "";
+    let i = 0;
+    let n = e.length();
+    while (i < n) {
+        let c = e[i];
+        if (c == "[") {
+            let depth = 1;
+            let j = i + 1;
+            let inner = "";
+            while (j < n && depth > 0) {
+                let cj = e[j];
+                if (cj == "[") { depth = depth + 1; }
+                else if (cj == "]") { depth = depth - 1; if (depth == 0) { j = j + 1; break; } }
+                inner = inner + cj;
+                j = j + 1;
+            }
+            let s = inner.trim();
+            if (s.endsWith("- 1")) { s = s.substring(0, s.length() - 3).trim(); }
+            out2 = out2 + "(" + unwrap(s) + ")";
+            i = j;
+        } else {
+            out2 = out2 + c; i = i + 1;
+        }
+    }
+    return out2;
+}
+
+// arithmetic expression → COBOL (strip dec wrappers, subscripts, names mapped)
+fn string revArith(string e) {
+    return revTokens(revSub(stripWrappers(unwrap(e))));
+}
+
+// a single operand (no arithmetic) → MOVE source; else COMPUTE.
+fn bool isArithExpr(string stripped) {
+    let s = stripped;
+    return s.includes(" + ") || s.includes(" - ") || s.includes(" * ")
+        || s.includes(" / ") || s.includes("**");
+}
+
+// class-test call → COBOL:  rtNumeric("" + (X)) → X IS NUMERIC
+fn string classCond(string call, string word) {
+    let open = call.indexOf("(");
+    let arg = call.substring(open + 1, call.length() - 1);   // "" + (X)
+    let plus = arg.indexOf("+");
+    if (plus >= 0) { arg = arg.substring(plus + 1); }
+    return revArith(arg) + " IS " + word;
+}
+
+// DISPLAY operand list: split on '+', map each, join with spaces
+fn string revDisplay(string e) {
+    let parts = splitPlus(e);
+    let s = "";
+    for (let p in parts) {
+        let piece = revArith(p);
+        if (s == "") { s = piece; } else { s = s + " " + piece; }
+    }
+    return s;
+}
+
+// condition → COBOL (==,&&,||,! ; class tests ; subscripts handled in revArith)
+fn string revCond(string e) {
+    let s = unwrap(e);
+    // class tests: rtNumeric/rtAlpha(...) → X IS [class]
+    if (s.startsWith("rtNumeric(")) { return classCond(s, "NUMERIC"); }
+    if (s.startsWith("!rtNumeric(")) { return classCond(s.substring(1), "NOT NUMERIC"); }
+    if (s.startsWith("rtAlphaUpper(")) { return classCond(s, "ALPHABETIC-UPPER"); }
+    if (s.startsWith("rtAlphaLower(")) { return classCond(s, "ALPHABETIC-LOWER"); }
+    if (s.startsWith("rtAlpha(")) { return classCond(s, "ALPHABETIC"); }
+    s = revArith(s);
+    s = s.replaceAll(" == ", " = ");
+    s = s.replaceAll("==", " = ");
+    s = s.replaceAll("&&", " AND ");
+    s = s.replaceAll("||", " OR ");
+    s = s.replaceAll("!=", " NOT = ");
+    return s.trim();
+}
+
+// ── driver ─────────────────────────────────────────────────────────────────────
+let file = "";
+let past = false;
+for (let a in Env.args()) {
+    if (past) { if (file == "") { file = a; } }
+    else if (a.toLowerCase().endsWith("serez.sz")) { past = true; }
+}
+if (file == "") {
+    out "usage: sz serez.sz <program.sz>";
+} else {
+    let src = File.read(file);
+    let lines = src.split("\n");
+
+    // 1. reconstruct the source halves from //@ annotations
+    let pre = "";
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("//@")) { pre = pre + t.substring(3).trim() + "\n"; }
+    }
+
+    // 2. translate the procedure
+    let body = "";
+    let inFn = false;
+    let closes = [];        // stack of strings to emit on each '}'
+    let tmpName = [];       // COMPUTE multi-receiver temps (__cN = expr)
+    let tmpExpr = [];
+    let i = 0;
+    let nL = lines.length();
+    while (i < nL) {
+        let raw = lines[i].replaceAll("\r", "");
+        let t = raw.trim();
+        i = i + 1;
+
+        if (t.startsWith("//")) { continue; }
+        if (t == "") { continue; }
+        if (t.startsWith("use ")) { continue; }
+
+        if (!inFn) {
+            // a paragraph definition?
+            if (t.startsWith("fn ") && t.includes("_()")) {
+                let nm = t.substring(3, t.indexOf("_()"));
+                body = body + "       " + cobName(nm) + ".\n";
+                inFn = true;
+            }
+            continue;   // skip globals, driver, let __goto, etc.
+        }
+
+        // inside a paragraph. `closes` holds scope-terminator markers:
+        //   "PERF"  → END-PERFORM ;  "IF:<n>" → n nested END-IFs (EVALUATE chains)
+        // A statement/terminator gets a '.' only when it leaves us at depth 0.
+        let ind = "           ";
+
+        if (t == r"}") {
+            if (closes.length() == 0) { inFn = false; continue; }   // end of fn
+            let m = closes.pop();
+            let dot0 = "";
+            if (closes.length() == 0) { dot0 = "."; }
+            if (m == "PERF") {
+                body = body + ind + "END-PERFORM" + dot0 + "\n";
+            } else {
+                // m == "IF:<n>" → emit n END-IF, period only on the last (top level)
+                let cnt = parseInt(m.substring(3));
+                let kk = 0;
+                while (kk < cnt) {
+                    let d2 = "";
+                    if (kk == cnt - 1) { d2 = dot0; }
+                    body = body + ind + "END-IF" + d2 + "\n";
+                    kk = kk + 1;
+                }
+            }
+            continue;
+        }
+        if (t == r"} else {") {
+            body = body + ind + "ELSE\n";
+            continue;
+        }
+        // EVALUATE chain lowered to "} else if (..) {": one logical block, one more
+        // nested IF in COBOL — bump the top IF marker's END-IF count, don't push.
+        if (t.startsWith(r"} else if (") && t.endsWith(r") {")) {
+            let cond = t.substring(11, t.length() - 3);
+            let top = closes.length() - 1;
+            let cnt = parseInt(closes[top].substring(3)) + 1;
+            closes[top] = "IF:" + cnt;
+            body = body + ind + "ELSE\n" + ind + "IF " + revCond(cond) + "\n";
+            continue;
+        }
+
+        // PERFORM <n> TIMES  (lowered: let __n=..; let __p=0; while(__p<__n){ ... __p=__p+1; })
+        if (t.startsWith("let __n") && i + 1 < nL) {
+            let eqp = t.indexOf("= ");
+            let cnt = t.substring(eqp + 2, t.length() - 1).trim();
+            let l2 = lines[i].replaceAll("\r", "").trim();
+            let l3 = "";
+            if (i + 1 < nL) { l3 = lines[i + 1].replaceAll("\r", "").trim(); }
+            if (l2.startsWith("let __p") && l3.startsWith("while (__p")) {
+                body = body + ind + "PERFORM " + revArith(cnt) + " TIMES\n";
+                closes.push("PERF");
+                i = i + 2;   // consume the let __p and while lines
+                continue;
+            }
+        }
+        // COMPUTE multi-receiver temp: let __cN = EXPR;  → remember EXPR
+        if (t.startsWith("let __c") && t.includes(" = ") && t.endsWith(";")) {
+            let e2 = t.indexOf(" = ");
+            tmpName.push(t.substring(4, e2).trim());
+            tmpExpr.push(t.substring(e2 + 3, t.length() - 1).trim());
+            continue;
+        }
+        if (t.startsWith("let __")) { continue; }   // other internal temps
+        if (t.startsWith("let ")) { continue; }     // local lets (rare)
+
+        // increment line of a lowered TIMES loop: __pN = __pN + 1;
+        if (t.startsWith("__p") && t.includes("= __p")) { continue; }
+        if (t.startsWith("__goto")) {
+            // __goto = "X"; return;  → GO TO X
+            if (t.includes("return")) {
+                let q1 = t.indexOf("\"");
+                let q2 = t.indexOf("\"", q1 + 1);
+                let target = t.substring(q1 + 1, q2);
+                let dot0 = "";
+                if (closes.length() == 0) { dot0 = "."; }
+                body = body + ind + "GO TO " + cobName(target) + dot0 + "\n";
+            }
+            continue;
+        }
+
+        if (t.startsWith("while (!(") && t.endsWith(r")) {")) {
+            let cond = t.substring(9, t.length() - 4);
+            body = body + ind + "PERFORM UNTIL " + revCond(cond) + "\n";
+            closes.push("PERF");
+            continue;
+        }
+        if (t.startsWith("if (") && t.endsWith(r") {")) {
+            let cond = t.substring(4, t.length() - 3);
+            body = body + ind + "IF " + revCond(cond) + "\n";
+            closes.push("IF:1");
+            continue;
+        }
+
+        // leaf statements — a trailing '.' only at paragraph level (depth 0)
+        let dot = "";
+        if (closes.length() == 0) { dot = "."; }
+
+        if (t.startsWith("out ")) {
+            let expr = t.substring(4, t.length() - 1);
+            body = body + ind + "DISPLAY " + revDisplay(expr) + dot + "\n";
+            continue;
+        }
+        if (t == "exit(0);") {
+            body = body + ind + "STOP RUN" + dot + "\n";
+            continue;
+        }
+        if (t.endsWith("_();")) {            // paragraph call:  NAME_();
+            let nm = t.substring(0, t.length() - 4);
+            body = body + ind + "PERFORM " + cobName(nm) + dot + "\n";
+            continue;
+        }
+        let eq = t.indexOf(" = ");           // assignment:  NAME = RHS;
+        if (eq > 0 && t.endsWith(";")) {
+            let lhs = t.substring(0, eq).trim();
+            let rhs = t.substring(eq + 3, t.length() - 1).trim();
+            let bare = stripWrappers(unwrap(rhs));
+            // is the RHS a COMPUTE multi-receiver temp (__cN)?
+            let tExpr = "";
+            let isTmp = false;
+            let ti = 0;
+            while (ti < tmpName.length()) {
+                if (bare == tmpName[ti]) { tExpr = tmpExpr[ti]; isTmp = true; }
+                ti = ti + 1;
+            }
+            if (isTmp) {
+                // gather consecutive receivers sharing the same temp → one COMPUTE
+                let recv = cobName(lhs);
+                while (i < nL) {
+                    let nx = lines[i].replaceAll("\r", "").trim();
+                    let e2 = nx.indexOf(" = ");
+                    if (e2 > 0 && nx.endsWith(";")
+                        && stripWrappers(unwrap(nx.substring(e2 + 3, nx.length() - 1).trim())) == bare) {
+                        recv = recv + " " + cobName(nx.substring(0, e2).trim());
+                        i = i + 1;
+                    } else { break; }
+                }
+                body = body + ind + "COMPUTE " + recv + " = " + revArith(tExpr) + dot + "\n";
+                continue;
+            }
+            if (isArithExpr(bare)) {
+                body = body + ind + "COMPUTE " + cobName(lhs) + " = " + revArith(rhs) + dot + "\n";
+            } else {
+                body = body + ind + "MOVE " + revArith(rhs) + " TO " + cobName(lhs) + dot + "\n";
+            }
+            continue;
+        }
+        // anything else: drop (driver internals)
+    }
+
+    let outName = file.substring(0, file.length() - 3) + ".cob";
+    File.write(outName, pre + "\n       PROCEDURE DIVISION.\n" + body);
+    out "translated " + file + " -> " + outName;
+}

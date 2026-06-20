@@ -1,0 +1,52 @@
+// Round-trip test (pure .sz): COBOL → .sz → COBOL → .sz → run, and check that
+// the behavior is preserved (output of the original .sz == output after a full
+// COBOL→sz→COBOL→sz round-trip through index.sz / serez.sz).
+//
+//   sz tests/run_roundtrip.sz        # from the repo root
+//
+// It works on temp copies (~rt.*) and never writes the examples/*.cob originals.
+// STRING/UNSTRING/INSPECT/reference-modification (strings.cob) and file I/O
+// (fileio.cob) do not reverse to COBOL verbs yet, so they are excluded.
+
+use permissions { OS, File, Env }
+
+let names = ["hello", "control", "invoice", "table", "payroll", "gotodemo",
+             "thrudemo", "features", "report", "fixed", "payroll_batch",
+             "copydemo", "batch"];
+
+fn runSz(string f) {
+    let r = null;
+    unsafe { r = OS.exec("sz", [f]); }
+    return r.stdout.replaceAll("\r", "").trim();
+}
+fn exec2(string a, string b) {
+    let r = null;
+    unsafe { r = OS.exec("sz", [a, b]); }
+    return r;
+}
+
+let pass = 0;
+let fail = 0;
+for (let nm in names) {
+    // fresh temp copy of the original COBOL
+    File.write("~rt.cob", File.read("examples/" + nm + ".cob"));
+    // original behavior: COBOL → .sz → run
+    exec2("cobol.sz", "~rt.cob");
+    let a = runSz("~rt.sz");
+    // round-trip: .sz → COBOL → .sz → run
+    exec2("serez.sz", "~rt.sz");          // writes ~rt.cob (regenerated)
+    exec2("cobol.sz", "~rt.cob");         // re-translate → ~rt.sz
+    let b = runSz("~rt.sz");
+    if (a == b) {
+        out "[OK]   " + nm;
+        pass = pass + 1;
+    } else {
+        out "[DIFF] " + nm;
+        out "  before: " + a;
+        out "  after:  " + b;
+        fail = fail + 1;
+    }
+}
+out "";
+out "ROUND-TRIP: " + pass + " preserved  " + fail + " differing";
+if (fail > 0) { exit(1); }
