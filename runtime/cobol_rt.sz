@@ -1,0 +1,98 @@
+// serez-cobol runtime — PIC editing for numeric-edited display fields.
+// Prepended to generated programs that use edited PICTUREs (Z, comma, $, '.').
+
+fn rtDecimals(string mask) {
+    let dot = mask.indexOf(".");
+    if (dot < 0) { return 0; }
+    let d = 0;
+    let i = dot + 1;
+    while (i < mask.length()) {
+        let c = mask[i];
+        if (c == "9" || c == "Z" || c == "*") { d = d + 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn rtGroup(string digits) {
+    // insert thousands separators into a run of digits
+    let g = "";
+    let n = digits.length();
+    let i = 0;
+    while (i < n) {
+        if (i > 0 && (n - i) % 3 == 0) { g = g + ","; }
+        g = g + digits[i];
+        i = i + 1;
+    }
+    return g;
+}
+
+// Format `val` (numeric) according to a numeric-edited PIC `mask`.
+fn fmtPic(any val, string mask) {
+    let m = mask.toUpperCase();
+    let nd = rtDecimals(m);
+    let v = (val) + 0m;
+    let neg = v < 0m;
+    if (neg) { v = 0m - v; }
+    let body = v.setScale(nd, "half-up").toString();
+    let intpart = body;
+    let frac = "";
+    let dotp = body.indexOf(".");
+    if (dotp >= 0) { intpart = body.substring(0, dotp); frac = body.substring(dotp + 1); }
+
+    // integer digit positions and edit features in the mask
+    let dotm = m.indexOf(".");
+    let intmask = m;
+    if (dotm >= 0) { intmask = m.substring(0, dotm); }
+    let intDigits = 0;
+    let dollars = 0;
+    let hasZ = false;
+    let hasComma = false;
+    let hasDollar = false;
+    let i = 0;
+    while (i < intmask.length()) {
+        let c = intmask[i];
+        if (c == "9" || c == "Z" || c == "*") { intDigits = intDigits + 1; }
+        if (c == "Z" || c == "*") { hasZ = true; }
+        if (c == ",") { hasComma = true; }
+        if (c == "$") { dollars = dollars + 1; hasDollar = true; }
+        i = i + 1;
+    }
+    // floating $: each $ is a digit position except the one that becomes the symbol
+    if (dollars > 0) { intDigits = intDigits + dollars - 1; hasZ = true; }
+
+    // left-pad / trim integer digits to the mask width
+    let ip = intpart;
+    while (ip.length() < intDigits) { ip = "0" + ip; }
+    if (intDigits > 0 && ip.length() > intDigits) {
+        ip = ip.substring(ip.length() - intDigits, ip.length());
+    }
+
+    // zero suppression (Z): leading zeros dropped, keep the final digit
+    let shown = ip;
+    if (hasZ) {
+        let res = "";
+        let started = false;
+        let len = ip.length();
+        let k = 0;
+        while (k < len) {
+            let ch = ip[k];
+            if (!started && ch == "0" && k < len - 1) {
+                // suppressed
+            } else {
+                started = true;
+                res = res + ch;
+            }
+            k = k + 1;
+        }
+        shown = res;
+    }
+
+    if (hasComma) { shown = rtGroup(shown); }
+
+    let result = shown;
+    if (nd > 0) { result = result + "." + frac; }
+    if (hasDollar) { result = "$" + result; }
+    if (neg) { result = "-" + result; }
+    return result;
+}

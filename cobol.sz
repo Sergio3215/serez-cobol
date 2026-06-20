@@ -70,6 +70,7 @@ fn string normalizeLine(string line) {
 // ── 1. TOKENIZER ─────────────────────────────────────────────────────────────
 fn [string] tokenizeAll([string] lines) {
     let toks = [];
+    let picPending = false;   // next non-IS token after PIC/PICTURE is a raw mask
     for (let raw in lines) {
         let line = normalizeLine(raw.replaceAll("\r", ""));
         let trimmed = line.trim();
@@ -80,6 +81,21 @@ fn [string] tokenizeAll([string] lines) {
             let c = line[i];
             if (c == " " || c == "\t") {
                 i = i + 1;
+            } else if (picPending) {
+                // read the PICTURE mask as one whitespace-delimited token
+                let tok = "";
+                while (i < n && line[i] != " " && line[i] != "\t") { tok = tok + line[i]; i = i + 1; }
+                if (tok.toUpperCase() == "IS") {
+                    // keep waiting for the mask
+                } else {
+                    if (tok.endsWith(".")) {
+                        toks.push("M:" + tok.substring(0, tok.length() - 1));
+                        toks.push("O:.");
+                    } else {
+                        toks.push("M:" + tok);
+                    }
+                    picPending = false;
+                }
             } else if (c == "\"" || c == "'") {
                 let q = c;
                 i = i + 1;
@@ -105,6 +121,8 @@ fn [string] tokenizeAll([string] lines) {
                     w = w + line[i]; i = i + 1;
                 }
                 toks.push("W:" + w);
+                let wu = w.toUpperCase();
+                if (wu == "PIC" || wu == "PICTURE") { picPending = true; }
             } else if (c == ">") {
                 if (i + 1 < n && line[i + 1] == "=") { toks.push("O:>="); i = i + 2; }
                 else { toks.push("O:>"); i = i + 1; }
@@ -127,6 +145,20 @@ fn [string] tokenizeAll([string] lines) {
 fn string picInfo(string mask) {
     let m = mask.toUpperCase();
     if (m.includes("X") || m.includes("A")) { return "string|0"; }
+    // numeric-edited: Z (suppress), comma, $, '.', * → formatted on assignment
+    if (m.includes("Z") || m.includes(",") || m.includes("$") || m.includes(".") || m.includes("*")) {
+        let dot = m.indexOf(".");
+        let sc = 0;
+        if (dot >= 0) {
+            let i = dot + 1;
+            while (i < m.length()) {
+                let c = m[i];
+                if (c == "9" || c == "Z" || c == "*") { sc = sc + 1; }
+                i = i + 1;
+            }
+        }
+        return "edited|" + sc;
+    }
     let vi = m.indexOf("V");
     if (vi >= 0) { return "dec|" + countNines(m.substring(vi + 1)); }
     return "int|0";
@@ -218,6 +250,7 @@ fn [string] collectVars([string] toks) {
                     else if (isWord(tj, "SPACE") || isWord(tj, "SPACES")) { init = "\"\""; }
                     initSet = true; valNext = false; j = j + 1; continue;
                 }
+                if (tkType(tj) == "M") { mask = tkVal(tj); inPic = false; j = j + 1; continue; }
                 if (inPic) { mask = mask + tkVal(tj); j = j + 1; continue; }
                 j = j + 1;
             }
@@ -225,8 +258,12 @@ fn [string] collectVars([string] toks) {
             let kind = info[0];
             let scale = parseInt(info[1]);
             if (mask == "") { kind = "group"; }   // no PIC ⇒ group item (organizational)
-            if (!initSet) { if (kind == "string") { init = "\"\""; } else { init = "0"; } }
-            vars.push(name + "|" + kind + "|" + scale + "|" + init + "|" + occ);
+            let emask = "";
+            if (kind == "edited") { emask = mask.toUpperCase(); }
+            if (!initSet) {
+                if (kind == "string" || kind == "edited") { init = "\"\""; } else { init = "0"; }
+            }
+            vars.push(name + "|" + kind + "|" + scale + "|" + init + "|" + occ + "|" + emask);
             lastVarSz = szName(name);
             lastVarKind = kind;
             i = j;
@@ -263,6 +300,13 @@ fn int varOccurs([string] vars, string name) {
     let parts = vars[idx].split("|");
     if (parts.length() < 5) { return 0; }
     return parseInt(parts[4]);
+}
+fn string varMask([string] vars, string name) {
+    let idx = varIndex(vars, name);
+    if (idx < 0) { return ""; }
+    let parts = vars[idx].split("|");
+    if (parts.length() < 6) { return ""; }
+    return parts[5];
 }
 // Reverse lookup: which file (cobol name) owns this FD record name?
 fn string fileByRec([string] vars, string rec) {
@@ -1108,14 +1152,22 @@ fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op)
 
 // ── assignment helpers (apply dec scaling to the destination) ─────────────────
 fn string assign([string] vars, string baseName, string lhs, string src, string ind) {
-    if (varKind(vars, baseName) == "dec") {
+    let k = varKind(vars, baseName);
+    if (k == "edited") {
+        return ind + lhs + " = fmtPic(" + src + ", \"" + varMask(vars, baseName) + "\");\n";
+    }
+    if (k == "dec") {
         // `+ 0m` lifts an int/int-literal source to exact dec so setScale applies.
         return ind + lhs + " = ((" + src + ") + 0m).setScale(" + varScale(vars, baseName) + ", \"down\");\n";
     }
     return ind + lhs + " = " + src + ";\n";
 }
 fn string assignExpr([string] vars, string baseName, string lhs, string expr, bool rounded, string ind) {
-    if (varKind(vars, baseName) == "dec") {
+    let k = varKind(vars, baseName);
+    if (k == "edited") {
+        return ind + lhs + " = fmtPic((" + expr + "), \"" + varMask(vars, baseName) + "\");\n";
+    }
+    if (k == "dec") {
         let mode = "down";
         if (rounded) { mode = "half-up"; }
         return ind + lhs + " = ((" + expr + ") + 0m).setScale(" + varScale(vars, baseName) + ", \"" + mode + "\");\n";
@@ -1124,7 +1176,16 @@ fn string assignExpr([string] vars, string baseName, string lhs, string expr, bo
 }
 
 // ── 8. TOP-LEVEL TRANSLATE ────────────────────────────────────────────────────
-fn string translate(string src) {
+fn bool anyEdited([string] vars) {
+    let i = 0;
+    while (i < vars.length()) {
+        if (vars[i].split("|")[1] == "edited") { return true; }
+        i = i + 1;
+    }
+    return false;
+}
+
+fn string translate(string src, string rtText) {
     let lines = src.replaceAll("\r", "").split("\n");
     let toks = tokenizeAll(lines);
     let vars = collectVars(toks);
@@ -1132,7 +1193,9 @@ fn string translate(string src) {
     for (let e in files) { vars.push(e); }
     let header = "// Generated by serez-cobol from COBOL source.\n\n";
     if (files.length() > 0) { header = header + "use permissions \{ File \}\n\n"; }
-    return header + emitVars(vars) + emitProcedure(toks, vars);
+    let rt = "";
+    if (anyEdited(vars) && rtText != "") { rt = rtText + "\n"; }
+    return header + rt + emitVars(vars) + emitProcedure(toks, vars);
 }
 
 // ── 9. COPY (copybook) PREPROCESSOR ───────────────────────────────────────────
@@ -1175,9 +1238,11 @@ fn string expandCopy(string src, string dir) {
 // ── 10. CLI DRIVER ────────────────────────────────────────────────────────────
 let args = Env.args();
 let inFile = "";
+let scriptDir = "";
 for (let a in args) {
     let low = a.toLowerCase();
     if (low.endsWith(".cob") || low.endsWith(".cbl")) { inFile = a; }
+    if (low.endsWith("cobol.sz")) { scriptDir = dirOf(a); }
 }
 if (inFile == "") {
     out "serez-cobol — COBOL → Serez (.sz) translator";
@@ -1185,7 +1250,10 @@ if (inFile == "") {
 } else {
     let raw = File.read(inFile);
     let expanded = expandCopy(raw, dirOf(inFile));
-    let result = translate(expanded);
+    let rtPath = scriptDir + "runtime/cobol_rt.sz";
+    let rtText = "";
+    if (File.exists(rtPath)) { rtText = File.read(rtPath); }
+    let result = translate(expanded, rtText);
     let outFile = inFile.substring(0, inFile.length() - 4) + ".sz";
     File.write(outFile, result);
     out "translated " + inFile + " -> " + outFile;
