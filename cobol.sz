@@ -170,6 +170,7 @@ fn [string] collectVars([string] toks) {
             let j = i + 2;
             let mask = "";
             let init = "";
+            let occ = 0;
             let inPic = false;
             let valNext = false;
             let initSet = false;
@@ -177,6 +178,12 @@ fn [string] collectVars([string] toks) {
                 let tj = toks[j];
                 if (isWord(tj, "PIC") || isWord(tj, "PICTURE")) { inPic = true; j = j + 1; continue; }
                 if (isWord(tj, "VALUE")) { inPic = false; valNext = true; j = j + 1; continue; }
+                if (isWord(tj, "OCCURS")) {
+                    inPic = false; j = j + 1;
+                    if (j < n && tkType(toks[j]) == "N") { occ = parseInt(tkVal(toks[j])); j = j + 1; }
+                    if (j < n && isWord(toks[j], "TIMES")) { j = j + 1; }
+                    continue;
+                }
                 if (valNext) {
                     if (tkType(tj) == "S") { init = "\"" + tkVal(tj) + "\""; }
                     else if (tkType(tj) == "D" || tkType(tj) == "N") { init = tkVal(tj); }
@@ -191,7 +198,7 @@ fn [string] collectVars([string] toks) {
             let kind = info[0];
             let scale = parseInt(info[1]);
             if (!initSet) { if (kind == "string") { init = "\"\""; } else { init = "0"; } }
-            vars.push(name + "|" + kind + "|" + scale + "|" + init);
+            vars.push(name + "|" + kind + "|" + scale + "|" + init + "|" + occ);
             lastVarSz = szName(name);
             lastVarKind = kind;
             i = j;
@@ -222,6 +229,13 @@ fn int    varScale([string] vars, string name) {
     if (idx < 0) { return 0; }
     return parseInt(vars[idx].split("|")[2]);
 }
+fn int varOccurs([string] vars, string name) {
+    let idx = varIndex(vars, name);
+    if (idx < 0) { return 0; }
+    let parts = vars[idx].split("|");
+    if (parts.length() < 5) { return 0; }
+    return parseInt(parts[4]);
+}
 
 // ── 4. EMIT WORKING-STORAGE AS .sz GLOBALS ────────────────────────────────────
 fn string emitVars([string] vars) {
@@ -234,14 +248,28 @@ fn string emitVars([string] vars) {
             let name = szName(p[0]);
             let scale = parseInt(p[2]);
             let init = p[3];
-            let rhs = init;
+            let occ = 0;
+            if (p.length() >= 5) { occ = parseInt(p[4]); }
+            let elem = init;
             if (kind == "dec") {
-                if (init == "0") { rhs = "0m"; } else { rhs = init + "m"; }
-                rhs = "(" + rhs + ").setScale(" + scale + ", \"down\")";
+                if (init == "0") { elem = "0m"; } else { elem = init + "m"; }
+                elem = "(" + elem + ").setScale(" + scale + ", \"down\")";
             } else if (kind == "int") {
-                if (init == "") { rhs = "0"; }
+                if (init == "") { elem = "0"; }
             }
-            s = s + "let " + name + " = " + rhs + ";\n";
+            if (occ > 0) {
+                // OCCURS table → array of `occ` initialized elements (1-indexed in COBOL)
+                let arr = "[";
+                let k = 0;
+                while (k < occ) {
+                    if (k > 0) { arr = arr + ", "; }
+                    arr = arr + elem;
+                    k = k + 1;
+                }
+                s = s + "let " + name + " = " + arr + "];\n";
+            } else {
+                s = s + "let " + name + " = " + elem + ";\n";
+            }
         }
         i = i + 1;
     }
@@ -285,6 +313,51 @@ fn string condToken([string] vars, string t) {
     return operand(vars, t);
 }
 
+fn bool isRelWord(string t) {
+    if (tkType(t) != "W") { return false; }
+    let u = tkUp(t);
+    return u == "AND" || u == "OR" || u == "GREATER" || u == "LESS" || u == "EQUAL"
+        || u == "EQUALS" || u == "THAN" || u == "IS" || u == "TO" || u == "NOT";
+}
+
+// Emit one operand, expanding an OCCURS subscript `NAME ( sub )` → `NAME[(sub)-1]`.
+// Returns [newPos, text].
+fn [any] emitRef([string] toks, int pos, [string] vars) {
+    let n = toks.length();
+    let t = toks[pos];
+    if (tkType(t) == "W") {
+        let nm = tkVal(t);
+        if (varOccurs(vars, nm) > 0 && pos + 1 < n
+            && tkType(toks[pos + 1]) == "O" && tkVal(toks[pos + 1]) == "(") {
+            let j = pos + 2;
+            let depth = 1;
+            let sub = "";
+            while (j < n && depth > 0) {
+                let tj = toks[j];
+                if (tkType(tj) == "O" && tkVal(tj) == "(") { depth = depth + 1; sub = sub + "( "; j = j + 1; continue; }
+                if (tkType(tj) == "O" && tkVal(tj) == ")") {
+                    depth = depth - 1;
+                    if (depth == 0) { j = j + 1; break; }
+                    sub = sub + ") "; j = j + 1; continue;
+                }
+                sub = sub + operand(vars, tj) + " ";
+                j = j + 1;
+            }
+            return [j, szName(nm) + "[(" + sub.trim() + ") - 1]"];
+        }
+        return [pos + 1, operand(vars, t)];
+    }
+    return [pos + 1, operand(vars, t)];
+}
+
+// Emit an assignment target (possibly subscripted). Returns [newPos, lhsText, baseName].
+fn [any] emitLhs([string] toks, int pos, [string] vars) {
+    let n = toks.length();
+    let base = tkVal(toks[pos]);
+    let r = emitRef(toks, pos, vars);
+    return [r[0], r[1], base];
+}
+
 // Statement-starting / clause-boundary keywords.
 fn bool isStmtKw(string t) {
     if (tkType(t) != "W") { return false; }
@@ -306,8 +379,9 @@ fn [any] grabExpr([string] toks, int pos, [string] vars, string stopWord) {
         let tj = toks[j];
         if (isDot(tj) || isStmtKw(tj)) { break; }
         if (stopWord != "" && isWord(tj, stopWord)) { break; }
-        expr = expr + operand(vars, tj) + " ";
-        j = j + 1;
+        let r = emitRef(toks, j, vars);
+        expr = expr + r[1] + " ";
+        j = r[0];
     }
     return [j, expr.trim()];
 }
@@ -321,9 +395,15 @@ fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
         if (isDot(tj) || isStmtKw(tj)) { break; }
         if (stopWord != "" && isWord(tj, stopWord)) { break; }
         if (isWord(tj, "THEN")) { j = j + 1; continue; }
-        let piece = condToken(vars, tj);
-        if (piece != "") { cond = cond + piece + " "; }
-        j = j + 1;
+        if (tkType(tj) == "O" || isRelWord(tj)) {
+            let piece = condToken(vars, tj);
+            if (piece != "") { cond = cond + piece + " "; }
+            j = j + 1;
+        } else {
+            let r = emitRef(toks, j, vars);
+            cond = cond + r[1] + " ";
+            j = r[0];
+        }
     }
     return [j, cond.trim()];
 }
@@ -547,38 +627,40 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         let parts = "";
         let first = true;
         while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
-            let piece = operand(vars, toks[j]);
-            if (piece != "") {
-                if (first) { parts = piece; first = false; }
-                else { parts = parts + " + " + piece; }
+            let r = emitRef(toks, j, vars);
+            if (r[1] != "") {
+                if (first) { parts = r[1]; first = false; }
+                else { parts = parts + " + " + r[1]; }
             }
-            j = j + 1;
+            j = r[0];
         }
         if (parts == "") { parts = "\"\""; }
         return [j, ind + "out " + parts + ";\n"];
     }
 
     if (kw == "MOVE") {
-        let src = operand(vars, toks[pos + 1]);
-        let j = pos + 2;
+        let rs = emitRef(toks, pos + 1, vars);
+        let src = rs[1];
+        let j = rs[0];
         if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
-        let dstName = tkVal(toks[j]);
-        j = j + 1;
-        return [j, assign(vars, dstName, src, ind)];
+        let rl = emitLhs(toks, j, vars);
+        j = rl[0];
+        return [j, assign(vars, rl[2], rl[1], src, ind)];
     }
 
     if (kw == "COMPUTE") {
-        let dstName = tkVal(toks[pos + 1]);
-        let j = pos + 2;
+        let rl = emitLhs(toks, pos + 1, vars);
+        let j = rl[0];
         if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == "=") { j = j + 1; }
         let expr = "";
         let rounded = false;
         while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
             if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
-            expr = expr + operand(vars, toks[j]) + " ";
-            j = j + 1;
+            let r = emitRef(toks, j, vars);
+            expr = expr + r[1] + " ";
+            j = r[0];
         }
-        return [j, assignExpr(vars, dstName, expr.trim(), rounded, ind)];
+        return [j, assignExpr(vars, rl[2], rl[1], expr.trim(), rounded, ind)];
     }
 
     if (kw == "ADD" || kw == "SUBTRACT" || kw == "MULTIPLY" || kw == "DIVIDE") {
@@ -646,76 +728,80 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
     return [j, ind + "// unsupported: " + tkVal(t) + "\n"];
 }
 
-// ADD/SUBTRACT/MULTIPLY/DIVIDE with optional GIVING/ROUNDED.
+// ADD/SUBTRACT/MULTIPLY/DIVIDE with optional GIVING/ROUNDED (operands subscript-aware).
 fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op) {
     let n = toks.length();
-    // collect operands until TO/FROM/BY/INTO/GIVING
     let j = pos + 1;
-    let ops = [];
+    // leading operand(s) until a connector word / keyword / '.'
+    let acc = "";
+    let first = true;
     while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])
            && !isWord(toks[j], "TO") && !isWord(toks[j], "FROM") && !isWord(toks[j], "BY")
            && !isWord(toks[j], "INTO") && !isWord(toks[j], "GIVING")) {
-        ops.push(operand(vars, toks[j]));
-        j = j + 1;
+        let r = emitRef(toks, j, vars);
+        if (first) { acc = r[1]; first = false; } else { acc = acc + " + " + r[1]; }
+        j = r[0];
     }
-    let connector = "";
-    if (j < n && tkType(toks[j]) == "W") { connector = tkUp(toks[j]); j = j + 1; }
-    // target operand(s)
-    let tgt = "";
-    if (j < n && tkType(toks[j]) == "W") { tgt = tkVal(toks[j]); j = j + 1; }
-    // GIVING <dst>
-    let giving = "";
+    let conn = "";
+    if (j < n && tkType(toks[j]) == "W") { conn = tkUp(toks[j]); j = j + 1; }
+
+    // target (possibly subscripted)
+    let tl = emitLhs(toks, j, vars);
+    let tgtLhs = tl[1];
+    let tgtBase = tl[2];
+    j = tl[0];
+
+    // optional GIVING <dest> and ROUNDED
+    let giveLhs = "";
+    let giveBase = "";
     let rounded = false;
     while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
-        if (isWord(toks[j], "GIVING")) { j = j + 1; if (j < n) { giving = tkVal(toks[j]); j = j + 1; } continue; }
+        if (isWord(toks[j], "GIVING")) {
+            j = j + 1;
+            let gl = emitLhs(toks, j, vars);
+            giveLhs = gl[1]; giveBase = gl[2]; j = gl[0];
+            continue;
+        }
         if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
         j = j + 1;
     }
 
-    let acc = ops[0];
-    let k = 1;
-    while (k < ops.length()) {
-        if (op == "ADD") { acc = acc + " + " + ops[k]; }
-        else { acc = acc + " + " + ops[k]; }
-        k = k + 1;
-    }
-
-    let dst = "";
+    let destBase = "";
+    let destLhs = "";
     let expr = "";
-    if (giving != "") {
-        dst = giving;
-        if (op == "ADD")      { expr = acc + " + " + szName(tgt); }
-        if (op == "SUBTRACT") { expr = szName(tgt) + " - (" + acc + ")"; }
-        if (op == "MULTIPLY") { expr = acc + " * " + szName(tgt); }
-        if (op == "DIVIDE")   { expr = szName(tgt) + " / (" + acc + ")"; }
+    if (conn == "GIVING") {
+        // ADD a b GIVING c  /  the target read above is actually the destination
+        destBase = tgtBase; destLhs = tgtLhs; expr = "(" + acc + ")";
     } else {
-        dst = tgt;
-        let d = szName(tgt);
-        if (op == "ADD")      { expr = d + " + (" + acc + ")"; }
-        if (op == "SUBTRACT") { expr = d + " - (" + acc + ")"; }
-        if (op == "MULTIPLY") { expr = d + " * (" + acc + ")"; }
-        if (op == "DIVIDE")   { expr = d + " / (" + acc + ")"; }
+        let useGiving = giveLhs != "";
+        if (useGiving) { destBase = giveBase; destLhs = giveLhs; }
+        else { destBase = tgtBase; destLhs = tgtLhs; }
+        if (op == "ADD")      { expr = tgtLhs + " + (" + acc + ")"; }
+        if (op == "SUBTRACT") { expr = tgtLhs + " - (" + acc + ")"; }
+        if (op == "MULTIPLY") { expr = "(" + acc + ") * " + tgtLhs; }
+        if (op == "DIVIDE") {
+            if (conn == "BY") { expr = "(" + acc + ") / " + tgtLhs; }
+            else { expr = tgtLhs + " / (" + acc + ")"; }
+        }
     }
-    return [j, assignExpr(vars, dst, expr, rounded, ind)];
+    return [j, assignExpr(vars, destBase, destLhs, expr, rounded, ind)];
 }
 
 // ── assignment helpers (apply dec scaling to the destination) ─────────────────
-fn string assign([string] vars, string dstName, string src, string ind) {
-    let dst = szName(dstName);
-    if (varKind(vars, dstName) == "dec") {
+fn string assign([string] vars, string baseName, string lhs, string src, string ind) {
+    if (varKind(vars, baseName) == "dec") {
         // `+ 0m` lifts an int/int-literal source to exact dec so setScale applies.
-        return ind + dst + " = ((" + src + ") + 0m).setScale(" + varScale(vars, dstName) + ", \"down\");\n";
+        return ind + lhs + " = ((" + src + ") + 0m).setScale(" + varScale(vars, baseName) + ", \"down\");\n";
     }
-    return ind + dst + " = " + src + ";\n";
+    return ind + lhs + " = " + src + ";\n";
 }
-fn string assignExpr([string] vars, string dstName, string expr, bool rounded, string ind) {
-    let dst = szName(dstName);
-    if (varKind(vars, dstName) == "dec") {
+fn string assignExpr([string] vars, string baseName, string lhs, string expr, bool rounded, string ind) {
+    if (varKind(vars, baseName) == "dec") {
         let mode = "down";
         if (rounded) { mode = "half-up"; }
-        return ind + dst + " = ((" + expr + ") + 0m).setScale(" + varScale(vars, dstName) + ", \"" + mode + "\");\n";
+        return ind + lhs + " = ((" + expr + ") + 0m).setScale(" + varScale(vars, baseName) + ", \"" + mode + "\");\n";
     }
-    return ind + dst + " = (" + expr + ");\n";
+    return ind + lhs + " = (" + expr + ");\n";
 }
 
 // ── 8. TOP-LEVEL TRANSLATE ────────────────────────────────────────────────────
