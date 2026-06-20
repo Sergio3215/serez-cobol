@@ -14,7 +14,7 @@ COMPUTE WS-TAX = WS-SUBTOTAL * 0.21 ROUNDED.
 ```
 becomes
 ```serez
-WS_TAX = (WS_SUBTOTAL * 0.21m).setScale(2, "half-up");
+WS_TAX = ((WS_SUBTOTAL * 0.21m) + 0m).setScale(2, "half-up");
 ```
 
 ## Usage
@@ -24,56 +24,59 @@ sz cobol.sz examples/invoice.cob      # writes examples/invoice.sz
 sz examples/invoice.sz                # run the translated program
 ```
 
-`cobol.sz` needs the `File` and `Env` permissions (declared in `serez.json` /
-via `use permissions { File, Env }`).
+`cobol.sz` needs the `File` and `Env` permissions (in `serez.json` / via
+`use permissions { File, Env }`). It auto-detects free- or fixed-format source.
 
-## What v0.1 supports
+## Supported (v1.0)
 
-| COBOL | Serez (`.sz`) |
-|---|---|
-| `IDENTIFICATION` / `DATA` / `PROCEDURE` divisions | parsed (free-format) |
-| `PIC 9(n)` | `int` |
-| `PIC 9(n)V9(m)`, `S9(n)V9(m)` | `dec` (exact), scale = fractional digits |
-| `PIC X(n)` | `string` |
-| `VALUE` clause / `ZERO` / `SPACE` | initializer |
-| `DISPLAY a b c` | `out a + b + c;` |
-| `MOVE x TO y` | `y = x;` (dec → `setScale`) |
-| `COMPUTE z = expr [ROUNDED]` | `z = (expr).setScale(s, "half-up"/"down");` |
-| `ADD x TO y` / `SUBTRACT x FROM y` | `y = y + x;` / `y = y - x;` |
-| `IF … [ELSE …] END-IF` | `if (…) { … } else { … }` |
-| `PERFORM para` | `para_();` |
-| paragraphs | `fn para_() { … }`, called in order (PERFORM targets stay subroutines) |
-| `STOP RUN` | end of flow |
+**Divisions & layout**
+- IDENTIFICATION / ENVIRONMENT (FILE-CONTROL) / DATA / PROCEDURE.
+- Free-format **and** fixed-format (cols 1-6 sequence, col 7 indicator, >72 ignored).
+- `COPY` copybooks (resolved next to the source; `REPLACING` ignored).
+- `*` / `*>` comments.
 
-`=` becomes `==` in conditions; `AND`/`OR`/`NOT` map to `&&`/`||`/`!`. COBOL
-identifiers (`WS-TOTAL`) become valid `.sz` names (`WS_TOTAL`).
+**Data (WORKING-STORAGE, FILE SECTION, LINKAGE)**
+- `PIC 9(n)` → `int` · `9(n)V9(m)` / `S9..V..` → exact `dec` · `X(n)`/`A(n)` → `string`.
+- Numeric-edited PICs (`Z`, `,`, `.`, `$`, `*`) → formatted on assignment.
+- `VALUE`, `ZERO`/`SPACE`; level **88** condition names; group items (organizational);
+  `OCCURS n TIMES` tables with subscripts `T(i)`.
+
+**Procedure**
+- `DISPLAY`, `MOVE`, `ACCEPT`, `INITIALIZE`, `CONTINUE`, `STOP RUN` (→ real exit).
+- `COMPUTE [ROUNDED]`; `ADD`/`SUBTRACT`/`MULTIPLY`/`DIVIDE` with `TO/FROM/BY/INTO/GIVING [ROUNDED]`.
+- `IF / ELSE / END-IF`; `EVALUATE … WHEN … WHEN OTHER … END-EVALUATE`
+  (subject value, or `EVALUATE TRUE`).
+- `PERFORM <para>`, `PERFORM <para> N TIMES | UNTIL c | VARYING v FROM a BY b UNTIL c`,
+  and inline `PERFORM … END-PERFORM`; paragraphs → functions.
+- Strings: reference modification `X(p:len)`, `STRING`, `UNSTRING`, `INSPECT TALLYING`/`REPLACING`.
+- Files (LINE SEQUENTIAL): `SELECT…ASSIGN`, `FD`, `OPEN`, `READ … AT END / NOT AT END … END-READ`,
+  `WRITE [FROM]`, `CLOSE`.
+
+**Conditions** — `= > < >= <=`, `GREATER`/`LESS`/`EQUAL [THAN/TO]`, `AND`/`OR`, 88-names.
+`=` → `==`; COBOL names (`WS-TOTAL`) → valid `.sz` names (`WS_TOTAL`).
 
 ### Worked example
 
-`examples/invoice.cob` → translated → run:
+`examples/payroll_batch.cob` (tables + dec + PERFORM VARYING + EVALUATE + PIC editing):
 
 ```
-Item:     Widget
-Subtotal: 59.97
-Tax:      12.59
-Total:    72.56
-Status:   premium
+Emp 1: gross 4,000.00 net $3,280.00 (MID)
+Emp 2: gross 3,200.00 net $2,624.00 (MID)
+Emp 3: gross 2,635.00 net $2,160.70 (MID)
+----------------------------
+Total net: $8,064.70
 ```
 
-Every amount is computed with exact `dec` arithmetic, so `19.99 * 3` and
-`* 0.21 ROUNDED` give the same results a COBOL runtime would.
+All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 
-## Not in v0.1 (planned)
+## Not yet supported (v1.x roadmap)
 
-- `PERFORM … UNTIL / VARYING / N TIMES`, `GO TO`, `EVALUATE`, nested `MOVE`
-  PICTURE truncation/padding, `OCCURS` tables, group items / `REDEFINES`.
-- `COMP-3` / packed-decimal / `COMP` binary fields and EBCDIC.
-- Fixed-column (cols 1-6 / 7 / 8-72) layout — v0.1 expects free-format with `*`
-  comment lines.
-- `sz → COBOL` (reverse direction).
-
-These are tracked for later versions. `STOP RUN` mid-flow is treated as
-end-of-program for the common "MAIN does PERFORMs then STOP RUN" pattern.
+- `CALL` / nested programs, `GO TO` / `ALTER`, `PERFORM … THRU`.
+- `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
+- `SORT`/`MERGE`, report writer, screen section; `ARITH(EXTEND)` 31-digit math
+  (`dec` covers 28–29 digits; larger is detected, not supported).
+- Group-level `MOVE`/`DISPLAY` (use elementary items); numeric interpretation of
+  raw record fields on `READ` (records arrive as strings).
 
 ## Tests
 
@@ -83,14 +86,15 @@ pwsh -File tests/run_tests.ps1 -generate  # regenerate golden .expected files
 ```
 
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
-its output is compared against `examples/<name>.expected`.
+its output compared against `examples/<name>.expected` (11 end-to-end cases).
 
 ## Layout
 
 ```
-cobol.sz             the translator (lexer + parser + emitter + CLI driver)
-examples/*.cob       sample COBOL programs
-examples/*.expected  golden output of the translated programs
+cobol.sz             the translator (lexer + parser + emitter + COPY + CLI)
+runtime/cobol_rt.sz  PIC-editing runtime, prepended when edited fields are used
+examples/*.cob       sample COBOL programs        (*.cpy copybooks)
+examples/*.expected  golden output of translated programs
 tests/run_tests.ps1  end-to-end test runner
 ```
 
@@ -98,7 +102,18 @@ tests/run_tests.ps1  end-to-end test runner
 
 `cobol.sz` is a single file (to sidestep import-ordering quirks):
 
-1. **Tokenizer** — line-oriented; `"T:value"` tokens (`W`ord/`S`tring/`N`um/`D`ecimal/`O`perator), `*` comment lines, `-` kept inside identifiers.
-2. **DATA pass** — `collectVars` reads `WORKING-STORAGE`, parses `PIC` masks into `kind|scale`, records initializers.
-3. **PROCEDURE pass** — `emitProcedure` splits the body into paragraphs (→ `fn`), translating each statement; `emitStmt` handles one statement and returns the next cursor position.
-4. **Emitter** — globals for working-storage, one `fn` per paragraph, a main section that calls the non-PERFORMed paragraphs in order.
+1. **COPY preprocess** — splice copybooks (driver, before tokenizing).
+2. **Tokenizer** — fixed/free normalization; typed `"T:value"` tokens
+   (`W`ord/`S`tring/`N`um/`D`ec/`O`p/`M`ask); `-` kept in identifiers; PIC masks
+   read whole.
+3. **DATA pass** — `collectVars` (PIC → kind/scale, 88, OCCURS, group, edited),
+   `collectFiles` (SELECT/FD/OPEN).
+4. **PROCEDURE pass** — `emitProcedure` splits paragraphs (→ `fn`) and drives a
+   block stack for IF/EVALUATE/PERFORM/READ; `emitStmt` translates one statement;
+   `emitRef`/`emitLhs` handle subscripts and reference modification.
+5. **Emitter** — working-storage globals, one `fn` per paragraph, a main section
+   calling the non-PERFORMed paragraphs in order.
+
+> Note on the source: strings the translator emits that contain `{`/`}` are
+> written `\{`/`\}` to avoid serez string interpolation; helper variables avoid
+> the reserved names `out`/`dec`.
