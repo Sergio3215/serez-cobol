@@ -81,9 +81,11 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 ## Tests
 
 ```sh
-pwsh -File tests/run_tests.ps1            # translate + run + diff vs golden
-pwsh -File tests/run_tests.ps1 -generate  # regenerate golden .expected files
+sz tests/run_tests.sz            # translate + run + diff vs golden
+sz tests/run_tests.sz generate   # regenerate golden .expected files
 ```
+
+The runner is pure `.sz` (uses `OS.exec` to drive `sz` on each example).
 
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
 its output compared against `examples/<name>.expected` (11 end-to-end cases).
@@ -95,7 +97,7 @@ cobol.sz             the translator (lexer + parser + emitter + COPY + CLI)
 runtime/cobol_rt.sz  PIC-editing runtime, prepended when edited fields are used
 examples/*.cob       sample COBOL programs        (*.cpy copybooks)
 examples/*.expected  golden output of translated programs
-tests/run_tests.ps1  end-to-end test runner
+tests/run_tests.sz   end-to-end test runner (pure .sz)
 ```
 
 ## Architecture

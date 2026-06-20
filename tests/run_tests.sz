@@ -1,0 +1,58 @@
+// serez-cobol test runner — pure .sz (no shell scripts).
+// For each examples/<name>.cob: translate with cobol.sz, run the generated .sz,
+// and compare its stdout against examples/<name>.expected (the golden).
+//
+//   sz tests/run_tests.sz            # run all and report PASS/FAIL
+//   sz tests/run_tests.sz generate   # (re)create the .expected golden files
+//
+// Invoke from the repo root. Uses the `sz` on PATH for the child processes.
+
+use permissions { OS, File, Env }
+
+let gen = false;
+for (let a in Env.args()) {
+    if (a == "generate" || a == "-generate") { gen = true; }
+}
+
+let dir = "examples";
+let pass = 0;
+let fail = 0;
+
+for (let e in File.listDir(dir)) {
+    if (e.endsWith(".cob")) {
+        let base = e.substring(0, e.length() - 4);
+        let cob = dir + "/" + e;
+        let szf = dir + "/" + base + ".sz";
+        let exp = dir + "/" + base + ".expected";
+
+        // translate, then run the generated program
+        let tr = null;
+        unsafe { tr = OS.exec("sz", ["cobol.sz", cob]); }
+        let rn = null;
+        unsafe { rn = OS.exec("sz", [szf]); }
+        let actual = rn.stdout.replaceAll("\r", "").trim();
+
+        if (gen) {
+            File.write(exp, actual);
+            out "[GEN]  " + base;
+        } else {
+            let want = "";
+            if (File.exists(exp)) { want = File.read(exp).replaceAll("\r", "").trim(); }
+            if (actual == want) {
+                out "[PASS] " + base;
+                pass = pass + 1;
+            } else {
+                out "[FAIL] " + base;
+                out "  expected: " + want;
+                out "  actual:   " + actual;
+                fail = fail + 1;
+            }
+        }
+    }
+}
+
+if (!gen) {
+    out "";
+    out "TOTAL: " + pass + " passed  " + fail + " failed";
+    if (fail > 0) { exit(1); }
+}

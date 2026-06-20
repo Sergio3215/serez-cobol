@@ -5,6 +5,6 @@
   "permissions": ["File", "Env"],
   "scripts": {
     "translate": "echo usage: sz cobol.sz <input.cob>",
-    "test": "pwsh -File tests/run_tests.ps1"
+    "test": "sz tests/run_tests.sz"
   }
 }
