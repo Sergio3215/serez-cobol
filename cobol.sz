@@ -1135,7 +1135,44 @@ fn string translate(string src) {
     return header + emitVars(vars) + emitProcedure(toks, vars);
 }
 
-// ── 9. CLI DRIVER ─────────────────────────────────────────────────────────────
+// ── 9. COPY (copybook) PREPROCESSOR ───────────────────────────────────────────
+fn string dirOf(string path) {
+    let idx = -1;
+    let i = 0;
+    while (i < path.length()) {
+        let c = path[i];
+        if (c == "/" || c == "\\") { idx = i; }
+        i = i + 1;
+    }
+    if (idx < 0) { return ""; }
+    return path.substring(0, idx + 1);
+}
+fn string readCopybook(string dir, string nm) {
+    let cands = [dir + nm, dir + nm + ".cpy", dir + nm + ".CPY", dir + nm + ".cob", dir + nm + ".cbl"];
+    for (let p in cands) { if (File.exists(p)) { return File.read(p); } }
+    return "*> COPY " + nm + " (not found)";
+}
+// Splice copybook content where `COPY name.` appears (one level; REPLACING ignored).
+fn string expandCopy(string src, string dir) {
+    let lines = src.replaceAll("\r", "").split("\n");
+    let outp = "";
+    for (let raw in lines) {
+        let tr = normalizeLine(raw).trim();
+        if (tr.toUpperCase().startsWith("COPY ")) {
+            let rest = tr.substring(5).trim();
+            let nm = "";
+            let k = 0;
+            while (k < rest.length() && rest[k] != " " && rest[k] != ".") { nm = nm + rest[k]; k = k + 1; }
+            nm = nm.replaceAll("\"", "");
+            outp = outp + readCopybook(dir, nm) + "\n";
+        } else {
+            outp = outp + raw + "\n";
+        }
+    }
+    return outp;
+}
+
+// ── 10. CLI DRIVER ────────────────────────────────────────────────────────────
 let args = Env.args();
 let inFile = "";
 for (let a in args) {
@@ -1146,7 +1183,9 @@ if (inFile == "") {
     out "serez-cobol — COBOL → Serez (.sz) translator";
     out "usage: sz cobol.sz <input.cob>";
 } else {
-    let result = translate(File.read(inFile));
+    let raw = File.read(inFile);
+    let expanded = expandCopy(raw, dirOf(inFile));
+    let result = translate(expanded);
     let outFile = inFile.substring(0, inFile.length() - 4) + ".sz";
     File.write(outFile, result);
     out "translated " + inFile + " -> " + outFile;
