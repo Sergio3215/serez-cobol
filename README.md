@@ -52,8 +52,8 @@ GO TO, conditions incl. class tests, subscripts).
 A COBOL→.sz→COBOL→.sz round-trip therefore preserves **behavior** (same output),
 though not byte-identical text (e.g. `ADD 1 TO X` comes back as `COMPUTE X = X + 1`;
 an `EVALUATE` comes back as nested `IF`s). `tests/run_roundtrip.sz` checks this on
-13 examples. Not yet reversed to COBOL verbs: `STRING`/`UNSTRING`/`INSPECT`/
-reference-modification and file I/O (they lower to Serez string/file methods).
+all 15 examples (including `STRING`/`UNSTRING`/`INSPECT`/reference-modification
+and full file I/O) — **15/15 preserve behavior**.
 
 ## Supported (v2.0)
 
@@ -117,9 +117,8 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
   (`dec` covers 28–29 digits; larger is detected, not supported).
 - Group-level `MOVE`/`DISPLAY` (use elementary items); numeric interpretation of
   raw record fields on `READ` (records arrive as strings).
-- Reverse direction (`serez.sz`): `STRING`/`UNSTRING`/`INSPECT`/reference-
-  modification and file I/O do not yet translate back to COBOL verbs (they lower
-  to Serez string/file methods). Everything else round-trips behaviorally.
+- Reverse direction (`serez.sz`): the round-trip is **behavioral**, not byte-for-
+  byte (idioms differ: `ADD`↔`COMPUTE`, `EVALUATE`↔nested `IF`, spacing).
 
 ## Tests
 
@@ -134,7 +133,8 @@ The runners are pure `.sz` (they use `OS.exec` to drive `sz` on each example).
 Each `examples/<name>.cob` is translated, the generated `.sz` is executed, and
 its output compared against `examples/<name>.expected` (15 end-to-end cases —
 including `features.cob`, a showcase of the v2.0 control-flow/condition features,
-and `batch.cob`, a file write→read→total→format integration).
+and `batch.cob`, a file write→read→total→format integration). `run_roundtrip.sz`
+additionally verifies all 15 survive a full COBOL→sz→COBOL→sz cycle unchanged.
 
 ## Layout
 
