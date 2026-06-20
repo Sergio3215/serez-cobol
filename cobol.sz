@@ -164,7 +164,8 @@ fn [string] collectVars([string] toks) {
         let t = toks[i];
         if (tkType(t) == "W") {
             let up = tkUp(t);
-            if (up == "WORKING-STORAGE") { inWS = true; i = i + 1; continue; }
+            // Collect from FILE SECTION (FD records) and WORKING-STORAGE alike.
+            if (up == "WORKING-STORAGE" || up == "FILE" || up == "LINKAGE") { inWS = true; i = i + 1; continue; }
             if (up == "PROCEDURE") { break; }
         }
         if (!inWS) { i = i + 1; continue; }
@@ -263,6 +264,96 @@ fn int varOccurs([string] vars, string name) {
     if (parts.length() < 5) { return 0; }
     return parseInt(parts[4]);
 }
+// Reverse lookup: which file (cobol name) owns this FD record name?
+fn string fileByRec([string] vars, string rec) {
+    let i = 0;
+    while (i < vars.length()) {
+        let p = vars[i].split("|");
+        if (p[1] == "file" && p.length() >= 5 && p[4] == rec) { return p[0]; }
+        i = i + 1;
+    }
+    return "";
+}
+
+// ── FILE-CONTROL / FD scan ── entry: "fname|file|mode|path|recname" ────────────
+fn [string] collectFiles([string] toks) {
+    let files = [];
+    let n = toks.length();
+    // SELECT fname ASSIGN TO path
+    let i = 0;
+    while (i < n) {
+        if (isWord(toks[i], "SELECT") && i + 1 < n && tkType(toks[i + 1]) == "W") {
+            let fname = tkVal(toks[i + 1]);
+            let path = fname;
+            let j = i + 2;
+            while (j < n && !isDot(toks[j]) && !isWord(toks[j], "SELECT")) {
+                if (isWord(toks[j], "ASSIGN")) {
+                    j = j + 1;
+                    if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
+                    if (j < n) { path = tkVal(toks[j]); j = j + 1; }
+                    continue;
+                }
+                j = j + 1;
+            }
+            files.push(fname + "|file|INPUT|" + path + "|");
+            i = j;
+            continue;
+        }
+        i = i + 1;
+    }
+    // FD fname → first following 01 record name
+    i = 0;
+    while (i < n) {
+        if (isWord(toks[i], "FD") && i + 1 < n && tkType(toks[i + 1]) == "W") {
+            let fname = tkVal(toks[i + 1]);
+            let j = i + 2;
+            while (j + 1 < n && !(tkType(toks[j]) == "N" && tkVal(toks[j]) == "01")) {
+                if (isWord(toks[j], "FD")) { break; }
+                j = j + 1;
+            }
+            let rec = "";
+            if (j + 1 < n && tkType(toks[j]) == "N" && tkVal(toks[j]) == "01" && tkType(toks[j + 1]) == "W") {
+                rec = tkVal(toks[j + 1]);
+            }
+            let k = 0;
+            while (k < files.length()) {
+                let p = files[k].split("|");
+                if (p[0] == fname) { files[k] = p[0] + "|file|" + p[2] + "|" + p[3] + "|" + rec; }
+                k = k + 1;
+            }
+            i = i + 2;
+            continue;
+        }
+        i = i + 1;
+    }
+    // OPEN <mode> fname … → record the access mode
+    i = 0;
+    while (i < n) {
+        if (isWord(toks[i], "OPEN")) {
+            let j = i + 1;
+            let mode = "INPUT";
+            while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) {
+                let u = "";
+                if (tkType(toks[j]) == "W") { u = tkUp(toks[j]); }
+                if (u == "INPUT" || u == "OUTPUT" || u == "EXTEND" || u == "I-O") { mode = u; j = j + 1; continue; }
+                if (tkType(toks[j]) == "W") {
+                    let fname = tkVal(toks[j]);
+                    let k = 0;
+                    while (k < files.length()) {
+                        let p = files[k].split("|");
+                        if (p[0] == fname) { files[k] = p[0] + "|file|" + mode + "|" + p[3] + "|" + p[4]; }
+                        k = k + 1;
+                    }
+                }
+                j = j + 1;
+            }
+            i = j;
+            continue;
+        }
+        i = i + 1;
+    }
+    return files;
+}
 
 // ── 4. EMIT WORKING-STORAGE AS .sz GLOBALS ────────────────────────────────────
 fn string emitVars([string] vars) {
@@ -271,7 +362,10 @@ fn string emitVars([string] vars) {
     while (i < vars.length()) {
         let p = vars[i].split("|");
         let kind = p[1];
-        if (kind != "cc" && kind != "group") {
+        if (kind == "file") {
+            let f = szName(p[0]);
+            s = s + "let " + f + "_lines = [];\nlet " + f + "_idx = 0;\nlet " + f + "_out = \"\";\n";
+        } else if (kind != "cc" && kind != "group") {
             let name = szName(p[0]);
             let scale = parseInt(p[2]);
             let init = p[3];
@@ -411,7 +505,8 @@ fn bool isStmtKw(string t) {
         || u == "ACCEPT" || u == "EVALUATE" || u == "WHEN" || u == "END-EVALUATE"
         || u == "END-PERFORM" || u == "CONTINUE" || u == "INITIALIZE"
         || u == "GO" || u == "NEXT" || u == "STRING" || u == "UNSTRING"
-        || u == "INSPECT";
+        || u == "INSPECT" || u == "OPEN" || u == "READ" || u == "WRITE"
+        || u == "CLOSE" || u == "END-READ";
 }
 
 // Build an expression from pos until a stmt keyword / '.' / optional stop word.
@@ -487,6 +582,7 @@ fn string emitProcedure([string] toks, [string] vars) {
     let curName = "";
     let curBody = "";
     let paraOrder = "";
+    let curEof = "";       // eof flag var of the current READ (for AT END / NOT AT END)
     let closeStack = [];   // close-text per open block (for END-x and '.')
     let evalSubj = [];     // parallel: EVALUATE subject ("" for non-eval blocks)
     let evalSeen = [];     // parallel: "1" once a WHEN was emitted
@@ -538,7 +634,7 @@ fn string emitProcedure([string] toks, [string] vars) {
             i = i + 1;
             continue;
         }
-        if (kw == "END-IF" || kw == "END-PERFORM" || kw == "END-EVALUATE") {
+        if (kw == "END-IF" || kw == "END-PERFORM" || kw == "END-EVALUATE" || kw == "END-READ") {
             if (closeStack.length() > 0) {
                 let ct = closeStack.pop();
                 evalSubj.pop();
@@ -546,6 +642,45 @@ fn string emitProcedure([string] toks, [string] vars) {
                 curBody = curBody + ct;
             }
             i = i + 1;
+            continue;
+        }
+
+        // READ <f> [NEXT] [RECORD] [INTO v] → self-contained read + EOF flag;
+        // AT END / NOT AT END become independent if(eof)/if(!eof) clause blocks.
+        if (kw == "READ") {
+            let fname = tkVal(toks[i + 1]);
+            let f = szName(fname);
+            let rec = szName(varField(vars, fname, 4));
+            let j = i + 2;
+            if (j < n && isWord(toks[j], "NEXT")) { j = j + 1; }
+            if (j < n && isWord(toks[j], "RECORD")) { j = j + 1; }
+            let intoV = "";
+            if (j < n && isWord(toks[j], "INTO")) { j = j + 1; intoV = szName(tkVal(toks[j])); j = j + 1; }
+            let ev = "__eof" + i;
+            curEof = ev;
+            curBody = curBody + ind + "let " + ev + " = (" + f + "_idx >= " + f + "_lines.length());\n";
+            let take = rec + " = " + f + "_lines[" + f + "_idx]; " + f + "_idx = " + f + "_idx + 1;";
+            if (intoV != "") { take = take + " " + intoV + " = " + rec + ";"; }
+            curBody = curBody + ind + "if (!" + ev + ") \{ " + take + " \}\n";
+            i = j;
+            continue;
+        }
+        // close a pending READ clause block (AT END / NOT AT END) if one is open
+        let topIsClause = closeStack.length() > 0 && evalSubj[closeStack.length() - 1] == "READCLAUSE";
+        if (kw == "AT" && i + 1 < n && isWord(toks[i + 1], "END")) {
+            if (topIsClause) { curBody = curBody + closeStack.pop(); evalSubj.pop(); evalSeen.pop(); }
+            let ind2 = indentOf(closeStack.length() + 1);
+            curBody = curBody + ind2 + "if (" + curEof + ") \{\n";
+            closeStack.push(ind2 + "\}\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
+            i = i + 2;
+            continue;
+        }
+        if (kw == "NOT" && i + 1 < n && isWord(toks[i + 1], "AT")) {
+            if (topIsClause) { curBody = curBody + closeStack.pop(); evalSubj.pop(); evalSeen.pop(); }
+            let ind2 = indentOf(closeStack.length() + 1);
+            curBody = curBody + ind2 + "if (!" + curEof + ") \{\n";
+            closeStack.push(ind2 + "\}\n"); evalSubj.push("READCLAUSE"); evalSeen.push("");
+            i = i + 3; // NOT AT END
             continue;
         }
 
@@ -843,6 +978,63 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind) {
         return [j, ind + para + "_();\n"];
     }
 
+    if (kw == "OPEN") {
+        let j = pos + 1;
+        let mode = "INPUT";
+        let code = "";
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) {
+            let u = "";
+            if (tkType(toks[j]) == "W") { u = tkUp(toks[j]); }
+            if (u == "INPUT" || u == "OUTPUT" || u == "EXTEND" || u == "I-O") { mode = u; j = j + 1; continue; }
+            if (tkType(toks[j]) == "W") {
+                let fname = tkVal(toks[j]);
+                let f = szName(fname);
+                let path = varField(vars, fname, 3);
+                if (mode == "INPUT") {
+                    code = code + ind + f + "_lines = File.read(\"" + path + "\").split(\"\\n\").filter((__ln) => __ln != \"\");\n";
+                    code = code + ind + f + "_idx = 0;\n";
+                } else {
+                    code = code + ind + f + "_out = \"\";\n";
+                }
+            }
+            j = j + 1;
+        }
+        return [j, code];
+    }
+
+    if (kw == "WRITE") {
+        let rec = tkVal(toks[pos + 1]);
+        let j = pos + 2;
+        let srcExpr = szName(rec);
+        if (j < n && isWord(toks[j], "FROM")) {
+            j = j + 1;
+            let rr = emitRef(toks, j, vars);
+            srcExpr = rr[1];
+            j = rr[0];
+        }
+        let fname = fileByRec(vars, rec);
+        let f = szName(fname);
+        return [j, ind + f + "_out = " + f + "_out + (\"\" + " + srcExpr + ") + \"\\n\";\n"];
+    }
+
+    if (kw == "CLOSE") {
+        let j = pos + 1;
+        let code = "";
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) {
+            if (tkType(toks[j]) == "W") {
+                let fname = tkVal(toks[j]);
+                let f = szName(fname);
+                let mode = varField(vars, fname, 2);
+                let path = varField(vars, fname, 3);
+                if (mode == "OUTPUT" || mode == "EXTEND") {
+                    code = code + ind + "File.write(\"" + path + "\", " + f + "_out);\n";
+                }
+            }
+            j = j + 1;
+        }
+        return [j, code];
+    }
+
     if (kw == "STOP") {
         let j = pos + 1;
         if (j < n && tkType(toks[j]) == "W") { j = j + 1; } // RUN
@@ -936,7 +1128,11 @@ fn string translate(string src) {
     let lines = src.replaceAll("\r", "").split("\n");
     let toks = tokenizeAll(lines);
     let vars = collectVars(toks);
-    return "// Generated by serez-cobol from COBOL source.\n\n" + emitVars(vars) + emitProcedure(toks, vars);
+    let files = collectFiles(toks);
+    for (let e in files) { vars.push(e); }
+    let header = "// Generated by serez-cobol from COBOL source.\n\n";
+    if (files.length() > 0) { header = header + "use permissions \{ File \}\n\n"; }
+    return header + emitVars(vars) + emitProcedure(toks, vars);
 }
 
 // ── 9. CLI DRIVER ─────────────────────────────────────────────────────────────
