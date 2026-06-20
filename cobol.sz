@@ -550,7 +550,7 @@ fn bool isStmtKw(string t) {
         || u == "END-PERFORM" || u == "CONTINUE" || u == "INITIALIZE"
         || u == "GO" || u == "NEXT" || u == "STRING" || u == "UNSTRING"
         || u == "INSPECT" || u == "OPEN" || u == "READ" || u == "WRITE"
-        || u == "CLOSE" || u == "END-READ";
+        || u == "CLOSE" || u == "END-READ" || u == "CALL";
 }
 
 // Build an expression from pos until a stmt keyword / '.' / optional stop word.
@@ -1059,6 +1059,15 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
         }
         while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
         return [j, code];
+    }
+
+    if (kw == "CALL") {
+        // CALL "SUB" [USING ...] — external subprograms can't be auto-linked.
+        let name = "";
+        if (pos + 1 < n) { name = tkVal(toks[pos + 1]); }
+        let j = pos + 1;
+        while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
+        return [j, ind + "// CALL " + name + " — external subprogram (not linked in v2.0)\n"];
     }
 
     if (kw == "GO") {

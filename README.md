@@ -20,12 +20,19 @@ WS_TAX = ((WS_SUBTOTAL * 0.21m) + 0m).setScale(2, "half-up");
 ## Usage
 
 ```sh
+# direct engine:
 sz cobol.sz examples/invoice.cob      # writes examples/invoice.sz
 sz examples/invoice.sz                # run the translated program
+
+# or via the unified CLI:
+sz serezTransform.sz toSerez examples/invoice.cob   # COBOL → .sz  (delegates to cobol.sz)
+sz serezTransform.sz toCobol examples/invoice.sz    # .sz → COBOL  (planned, future)
 ```
 
 `cobol.sz` needs the `File` and `Env` permissions (in `serez.json` / via
 `use permissions { File, Env }`). It auto-detects free- or fixed-format source.
+`serezTransform.sz` is the front-end dispatcher (`toSerez` works today; `toCobol`,
+the reverse direction, is reserved for a future release).
 
 ## Supported (v1.0)
 
@@ -46,8 +53,11 @@ sz examples/invoice.sz                # run the translated program
 - `COMPUTE [ROUNDED]`; `ADD`/`SUBTRACT`/`MULTIPLY`/`DIVIDE` with `TO/FROM/BY/INTO/GIVING [ROUNDED]`.
 - `IF / ELSE / END-IF`; `EVALUATE … WHEN … WHEN OTHER … END-EVALUATE`
   (subject value, or `EVALUATE TRUE`).
-- `PERFORM <para>`, `PERFORM <para> N TIMES | UNTIL c | VARYING v FROM a BY b UNTIL c`,
+- `PERFORM <para> [THRU <para2>]`, `… N TIMES | UNTIL c | VARYING v FROM a BY b UNTIL c`,
   and inline `PERFORM … END-PERFORM`; paragraphs → functions.
+- `GO TO <para>` (forward skip and backward loops) — paragraphs run under a
+  program-counter driver, so `GO TO`, fall-through and `STOP RUN` all behave like
+  COBOL. (`GO TO … DEPENDING ON` and `GO TO` inside a PERFORMed paragraph: not yet.)
 - Strings: reference modification `X(p:len)`, `STRING`, `UNSTRING`, `INSPECT TALLYING`/`REPLACING`.
 - Files (LINE SEQUENTIAL): `SELECT…ASSIGN`, `FD`, `OPEN`, `READ … AT END / NOT AT END … END-READ`,
   `WRITE [FROM]`, `CLOSE`.
@@ -69,14 +79,17 @@ Total net: $8,064.70
 
 All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 
-## Not yet supported (v1.x roadmap)
+## Not yet supported (roadmap)
 
-- `CALL` / nested programs, `GO TO` / `ALTER`, `PERFORM … THRU`.
+- `CALL` / nested programs (emitted as a comment — external subprograms can't be
+  auto-linked); `GO TO … DEPENDING ON`; `ALTER`.
 - `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
 - `SORT`/`MERGE`, report writer, screen section; `ARITH(EXTEND)` 31-digit math
   (`dec` covers 28–29 digits; larger is detected, not supported).
 - Group-level `MOVE`/`DISPLAY` (use elementary items); numeric interpretation of
   raw record fields on `READ` (records arrive as strings).
+- **`toCobol`** — the reverse direction (Serez `.sz` → COBOL). Reserved as the
+  next major objective; `serezTransform.sz` already exposes the command.
 
 ## Tests
 
@@ -93,7 +106,8 @@ its output compared against `examples/<name>.expected` (11 end-to-end cases).
 ## Layout
 
 ```
-cobol.sz             the translator (lexer + parser + emitter + COPY + CLI)
+serezTransform.sz    unified CLI dispatcher (toSerez / toCobol)
+cobol.sz             the COBOL→sz engine (lexer + parser + emitter + COPY + CLI)
 runtime/cobol_rt.sz  PIC-editing runtime, prepended when edited fields are used
 examples/*.cob       sample COBOL programs        (*.cpy copybooks)
 examples/*.expected  golden output of translated programs

@@ -1,0 +1,41 @@
+// serezTransform — unified CLI for serez-cobol translation.
+//
+//   sz serezTransform.sz toSerez <input.cob>   COBOL → Serez (.sz)   [implemented]
+//   sz serezTransform.sz toCobol <input.sz>    Serez (.sz) → COBOL   [planned]
+//
+// `toSerez` delegates to the cobol.sz engine. Run from the repo root.
+
+use permissions { OS, Env, File }
+
+let cmd = "";
+let file = "";
+for (let a in Env.args()) {
+    let low = a.toLowerCase();
+    if (low == "toserez" || low == "tocobol") {
+        cmd = low;
+    } else if (low.endsWith(".cob") || low.endsWith(".cbl")) {
+        file = a;
+    } else if (low.endsWith(".sz") && !low.endsWith("sereztransform.sz") && !low.endsWith("cobol.sz")) {
+        file = a;
+    }
+}
+
+if (cmd == "toserez") {
+    if (file == "") {
+        out "usage: sz serezTransform.sz toSerez <input.cob>";
+    } else {
+        let r = null;
+        unsafe { r = OS.exec("sz", ["cobol.sz", file]); }
+        let so = r.stdout.trim();
+        let se = r.stderr.trim();
+        if (so != "") { out so; }
+        if (se != "") { out se; }
+    }
+} else if (cmd == "tocobol") {
+    out "toCobol (Serez .sz → COBOL) is planned for a future release.";
+    if (file != "") { out "  (input: " + file + ")"; }
+} else {
+    out "serezTransform — serez-cobol translation CLI";
+    out "  sz serezTransform.sz toSerez <input.cob>   COBOL -> Serez (.sz)";
+    out "  sz serezTransform.sz toCobol <input.sz>    Serez (.sz) -> COBOL  [planned]";
+}
