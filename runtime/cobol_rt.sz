@@ -1,5 +1,48 @@
-// serez-cobol runtime — PIC editing for numeric-edited display fields.
-// Prepended to generated programs that use edited PICTUREs (Z, comma, $, '.').
+// serez-cobol runtime — PIC editing + class tests for generated programs.
+// Prepended to programs that use edited PICTUREs (Z, comma, $, '.') or the
+// IS NUMERIC / IS ALPHABETIC class conditions.
+
+// Class tests: a COBOL class condition holds only for a non-empty value whose
+// every character is of the given class (spaces allowed for ALPHABETIC).
+fn rtNumeric(string s) {
+    if (s.length() == 0) { return false; }
+    let i = 0;
+    while (i < s.length()) {
+        if (!"0123456789".includes(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn rtAlpha(string s) {
+    if (s.length() == 0) { return false; }
+    let alf = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz ";
+    let i = 0;
+    while (i < s.length()) {
+        if (!alf.includes(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn rtAlphaUpper(string s) {
+    if (s.length() == 0) { return false; }
+    let alf = "ABCDEFGHIJKLMNOPQRSTUVWXYZ ";
+    let i = 0;
+    while (i < s.length()) {
+        if (!alf.includes(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+fn rtAlphaLower(string s) {
+    if (s.length() == 0) { return false; }
+    let alf = "abcdefghijklmnopqrstuvwxyz ";
+    let i = 0;
+    while (i < s.length()) {
+        if (!alf.includes(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
 
 fn rtDecimals(string mask) {
     let dot = mask.indexOf(".");
