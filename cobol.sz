@@ -41,11 +41,37 @@ fn string indentOf(int depth) {
     return s;
 }
 
+// Normalize one source line for fixed-format COBOL: a 6-digit sequence area in
+// cols 1-6 is stripped, col 7 is the indicator ('*'/'/' = comment), and cols
+// beyond 72 are ignored. Free-format lines pass through unchanged.
+fn string normalizeLine(string line) {
+    let nlen = line.length();
+    if (nlen >= 7) {
+        let ind = line[6];
+        let seq = true;
+        let k = 0;
+        while (k < 6) { if (!isDigitCh(line[k])) { seq = false; } k = k + 1; }
+        if (seq) {
+            if (ind == "*" || ind == "/") { return ""; }
+            let endc = nlen;
+            if (endc > 72) { endc = 72; }
+            return line.substring(7, endc);
+        }
+        if (ind == "*" || ind == "/") {
+            let blank = true;
+            let m = 0;
+            while (m < 6) { if (line[m] != " ") { blank = false; } m = m + 1; }
+            if (blank) { return ""; }
+        }
+    }
+    return line;
+}
+
 // ── 1. TOKENIZER ─────────────────────────────────────────────────────────────
 fn [string] tokenizeAll([string] lines) {
     let toks = [];
     for (let raw in lines) {
-        let line = raw.replaceAll("\r", "");
+        let line = normalizeLine(raw.replaceAll("\r", ""));
         let trimmed = line.trim();
         if (trimmed.startsWith("*")) { continue; }   // whole-line comment
         let i = 0;
@@ -197,6 +223,7 @@ fn [string] collectVars([string] toks) {
             let info = picInfo(mask).split("|");
             let kind = info[0];
             let scale = parseInt(info[1]);
+            if (mask == "") { kind = "group"; }   // no PIC ⇒ group item (organizational)
             if (!initSet) { if (kind == "string") { init = "\"\""; } else { init = "0"; } }
             vars.push(name + "|" + kind + "|" + scale + "|" + init + "|" + occ);
             lastVarSz = szName(name);
@@ -244,7 +271,7 @@ fn string emitVars([string] vars) {
     while (i < vars.length()) {
         let p = vars[i].split("|");
         let kind = p[1];
-        if (kind != "cc") {
+        if (kind != "cc" && kind != "group") {
             let name = szName(p[0]);
             let scale = parseInt(p[2]);
             let init = p[3];
