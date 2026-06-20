@@ -488,6 +488,36 @@ fn bool isRelWord(string t) {
         || u == "EQUALS" || u == "THAN" || u == "IS" || u == "TO" || u == "NOT";
 }
 
+// Is `t` a relational operator (symbol or word) — used to fold "NOT >" etc.
+fn bool isRelOpTok(string t) {
+    if (tkType(t) == "O") {
+        let v = tkVal(t);
+        return v == ">" || v == "<" || v == ">=" || v == "<=" || v == "=";
+    }
+    if (tkType(t) == "W") {
+        let u = tkUp(t);
+        return u == "GREATER" || u == "LESS" || u == "EQUAL" || u == "EQUALS";
+    }
+    return false;
+}
+// The negation of a relational operator token (for COBOL "X NOT > Y").
+fn string negRel(string t) {
+    let v = "";
+    if (tkType(t) == "O") { v = tkVal(t); }
+    else {
+        let u = tkUp(t);
+        if (u == "GREATER") { v = ">"; }
+        if (u == "LESS") { v = "<"; }
+        if (u == "EQUAL" || u == "EQUALS") { v = "="; }
+    }
+    if (v == ">") { return "<="; }
+    if (v == "<") { return ">="; }
+    if (v == "=") { return "!="; }
+    if (v == ">=") { return "<"; }
+    if (v == "<=") { return ">"; }
+    return "!=";
+}
+
 // Emit one operand, expanding an OCCURS subscript `NAME ( sub )` → `NAME[(sub)-1]`.
 // Returns [newPos, text].
 fn [any] emitRef([string] toks, int pos, [string] vars) {
@@ -556,6 +586,15 @@ fn bool isStmtKw(string t) {
         || u == "CLOSE" || u == "END-READ" || u == "CALL";
 }
 
+// End of an operand/target list: a statement boundary, or an inline-clause word
+// (AT / NOT / END / END-xxx) such as those in READ ... AT END / NOT AT END.
+fn bool isTargetEnd(string t) {
+    if (isDot(t) || isStmtKw(t)) { return true; }
+    if (tkType(t) != "W") { return false; }
+    let u = tkUp(t);
+    return u == "AT" || u == "NOT" || u == "END" || u.startsWith("END-");
+}
+
 // Build an expression from pos until a stmt keyword / '.' / optional stop word.
 fn [any] grabExpr([string] toks, int pos, [string] vars, string stopWord) {
     let n = toks.length();
@@ -581,6 +620,36 @@ fn [any] grabCond([string] toks, int pos, [string] vars, string stopWord) {
         if (isDot(tj) || isStmtKw(tj)) { break; }
         if (stopWord != "" && isWord(tj, stopWord)) { break; }
         if (isWord(tj, "THEN")) { j = j + 1; continue; }
+        if (isWord(tj, "NOT")) {
+            // "X NOT > Y" — NOT directly before a relop → negated operator
+            if (j + 1 < n && isRelOpTok(toks[j + 1])) {
+                cond = cond + negRel(toks[j + 1]) + " ";
+                j = j + 2;
+                continue;
+            }
+            // "NOT ( ... )" — logical negation of a parenthesized group
+            if (j + 1 < n && tkType(toks[j + 1]) == "O" && tkVal(toks[j + 1]) == "(") {
+                cond = cond + "!";
+                j = j + 1;
+                continue;
+            }
+            // "NOT <a> <relop> <b>" — negate the simple relation → !(a op b)
+            let r1 = emitRef(toks, j + 1, vars);
+            let k = r1[0];
+            if (k < n && isRelOpTok(toks[k])) {
+                let opv = condToken(vars, toks[k]);
+                let m = k + 1;
+                while (m < n && (isWord(toks[m], "THAN") || isWord(toks[m], "TO") || isWord(toks[m], "IS"))) { m = m + 1; }
+                let r2 = emitRef(toks, m, vars);
+                cond = cond + "!(" + r1[1] + " " + opv + " " + r2[1] + ") ";
+                j = r2[0];
+                continue;
+            }
+            // "NOT <88-name>" — negate the condition expression
+            cond = cond + "!(" + r1[1] + ") ";
+            j = k;
+            continue;
+        }
         if (tkType(tj) == "O" || isRelWord(tj)) {
             let piece = condToken(vars, tj);
             if (piece != "") { cond = cond + piece + " "; }
@@ -956,9 +1025,14 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
         let src = rs[1];
         let j = rs[0];
         if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
-        let rl = emitLhs(toks, j, vars);
-        j = rl[0];
-        return [j, assign(vars, rl[2], rl[1], src, ind)];
+        // MOVE x TO a b c  — assign to every destination
+        let code = "";
+        while (j < n && !isTargetEnd(toks[j])) {
+            let rl = emitLhs(toks, j, vars);
+            code = code + assign(vars, rl[2], rl[1], src, ind);
+            j = rl[0];
+        }
+        return [j, code];
     }
 
     if (kw == "COMPUTE") {
@@ -1222,23 +1296,30 @@ fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op)
     let conn = "";
     if (j < n && tkType(toks[j]) == "W") { conn = tkUp(toks[j]); j = j + 1; }
 
-    // target (possibly subscripted)
-    let tl = emitLhs(toks, j, vars);
-    let tgtLhs = tl[1];
-    let tgtBase = tl[2];
-    j = tl[0];
+    // target list right after the connector (each may be subscripted)
+    let tgtLhs = [];
+    let tgtBase = [];
+    while (j < n && !isTargetEnd(toks[j])
+           && !isWord(toks[j], "GIVING") && !isWord(toks[j], "REMAINDER")
+           && !isWord(toks[j], "ROUNDED")) {
+        let tl = emitLhs(toks, j, vars);
+        tgtLhs.push(tl[1]); tgtBase.push(tl[2]); j = tl[0];
+    }
 
-    // optional GIVING <dest>, REMAINDER <dest> and ROUNDED
-    let giveLhs = "";
-    let giveBase = "";
+    // optional GIVING <dest...>, REMAINDER <dest> and ROUNDED
+    let giveLhs = [];
+    let giveBase = [];
     let remLhs = "";
     let remBase = "";
     let rounded = false;
-    while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
+    while (j < n && !isTargetEnd(toks[j])) {
         if (isWord(toks[j], "GIVING")) {
             j = j + 1;
-            let gl = emitLhs(toks, j, vars);
-            giveLhs = gl[1]; giveBase = gl[2]; j = gl[0];
+            while (j < n && !isTargetEnd(toks[j])
+                   && !isWord(toks[j], "REMAINDER") && !isWord(toks[j], "ROUNDED")) {
+                let gl = emitLhs(toks, j, vars);
+                giveLhs.push(gl[1]); giveBase.push(gl[2]); j = gl[0];
+            }
             continue;
         }
         if (isWord(toks[j], "REMAINDER")) {
@@ -1251,32 +1332,50 @@ fn [any] emitArith([string] toks, int pos, [string] vars, string ind, string op)
         j = j + 1;
     }
 
-    let destBase = "";
-    let destLhs = "";
-    let expr = "";
+    let code = "";
     if (conn == "GIVING") {
-        // ADD a b GIVING c  /  the target read above is actually the destination
-        destBase = tgtBase; destLhs = tgtLhs; expr = "(" + acc + ")";
-    } else {
-        let useGiving = giveLhs != "";
-        if (useGiving) { destBase = giveBase; destLhs = giveLhs; }
-        else { destBase = tgtBase; destLhs = tgtLhs; }
-        if (op == "ADD")      { expr = tgtLhs + " + (" + acc + ")"; }
-        if (op == "SUBTRACT") { expr = tgtLhs + " - (" + acc + ")"; }
-        if (op == "MULTIPLY") { expr = "(" + acc + ") * " + tgtLhs; }
-        if (op == "DIVIDE") {
-            if (conn == "BY") { expr = "(" + acc + ") / " + tgtLhs; }
-            else { expr = tgtLhs + " / (" + acc + ")"; }
+        // ADD a b GIVING c [d ...] — every dest = sum of operands
+        let k = 0;
+        while (k < tgtLhs.length()) {
+            code = code + assignExpr(vars, tgtBase[k], tgtLhs[k], "(" + acc + ")", rounded, ind);
+            k = k + 1;
         }
-    }
-    let code = assignExpr(vars, destBase, destLhs, expr, rounded, ind);
-    // DIVIDE ... GIVING q REMAINDER r  →  r = dividend - q * divisor
-    if (remLhs != "" && op == "DIVIDE") {
-        let dvd = acc;
-        let dvs = tgtLhs;
-        if (conn == "INTO") { dvd = tgtLhs; dvs = acc; }
-        let rExpr = "(" + dvd + ") - (" + destLhs + " * (" + dvs + "))";
-        code = code + assignExpr(vars, remBase, remLhs, rExpr, false, ind);
+    } else if (giveLhs.length() > 0) {
+        // operand form with GIVING: the single target is an operand, dests = GIVING list
+        let optgt = tgtLhs[0];
+        let k = 0;
+        while (k < giveLhs.length()) {
+            let expr = "(" + acc + ")";
+            if (op == "ADD")      { expr = optgt + " + (" + acc + ")"; }
+            if (op == "SUBTRACT") { expr = optgt + " - (" + acc + ")"; }
+            if (op == "MULTIPLY") { expr = "(" + acc + ") * " + optgt; }
+            if (op == "DIVIDE") {
+                if (conn == "BY") { expr = "(" + acc + ") / " + optgt; }
+                else { expr = optgt + " / (" + acc + ")"; }
+            }
+            code = code + assignExpr(vars, giveBase[k], giveLhs[k], expr, rounded, ind);
+            k = k + 1;
+        }
+        // DIVIDE ... GIVING q REMAINDER r  →  r = dividend - q * divisor
+        if (remLhs != "" && op == "DIVIDE") {
+            let dvd = acc;
+            let dvs = optgt;
+            if (conn == "INTO") { dvd = optgt; dvs = acc; }
+            let rExpr = "(" + dvd + ") - (" + giveLhs[0] + " * (" + dvs + "))";
+            code = code + assignExpr(vars, remBase, remLhs, rExpr, false, ind);
+        }
+    } else {
+        // accumulate into each target: a TO b c  /  FROM b c  /  BY b c  /  INTO b c
+        let k = 0;
+        while (k < tgtLhs.length()) {
+            let d = tgtLhs[k];
+            let expr = d + " + (" + acc + ")";
+            if (op == "SUBTRACT") { expr = d + " - (" + acc + ")"; }
+            if (op == "MULTIPLY") { expr = "(" + acc + ") * " + d; }
+            if (op == "DIVIDE")   { expr = d + " / (" + acc + ")"; }
+            code = code + assignExpr(vars, tgtBase[k], d, expr, rounded, ind);
+            k = k + 1;
+        }
     }
     return [j, code];
 }
