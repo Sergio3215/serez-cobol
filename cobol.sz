@@ -583,7 +583,7 @@ fn bool isStmtKw(string t) {
         || u == "END-PERFORM" || u == "CONTINUE" || u == "INITIALIZE"
         || u == "GO" || u == "NEXT" || u == "STRING" || u == "UNSTRING"
         || u == "INSPECT" || u == "OPEN" || u == "READ" || u == "WRITE"
-        || u == "CLOSE" || u == "END-READ" || u == "CALL";
+        || u == "CLOSE" || u == "END-READ" || u == "CALL" || u == "SET";
 }
 
 // End of an operand/target list: a statement boundary, or an inline-clause word
@@ -1161,6 +1161,35 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
         }
         while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
         return [j, code];
+    }
+
+    if (kw == "SET") {
+        // SET <88-name> TO TRUE  →  parent = value
+        // SET <var> TO <n> | UP BY <n> | DOWN BY <n>
+        let nm = tkVal(toks[pos + 1]);
+        let j = pos + 2;
+        if (varKind(vars, nm) == "cc") {
+            let parts = varField(vars, nm, 3).split(" == ");
+            let code = "";
+            if (parts.length() >= 2) { code = ind + parts[0] + " = " + parts[1] + ";\n"; }
+            while (j < n && !isDot(toks[j]) && !isStmtKw(toks[j])) { j = j + 1; }
+            return [j, code];
+        }
+        let lhs = szName(nm);
+        if (j < n && isWord(toks[j], "TO")) {
+            let r = emitRef(toks, j + 1, vars);
+            return [r[0], ind + lhs + " = " + r[1] + ";\n"];
+        }
+        if (j < n && (isWord(toks[j], "UP") || isWord(toks[j], "DOWN"))) {
+            let opc = "+";
+            if (isWord(toks[j], "DOWN")) { opc = "-"; }
+            j = j + 1;
+            if (j < n && isWord(toks[j], "BY")) { j = j + 1; }
+            let r = emitRef(toks, j, vars);
+            return [r[0], ind + lhs + " = " + lhs + " " + opc + " (" + r[1] + ");\n"];
+        }
+        while (j < n && !isDot(toks[j])) { j = j + 1; }
+        return [j, ind + "// SET (unsupported form)\n"];
     }
 
     if (kw == "CALL") {
