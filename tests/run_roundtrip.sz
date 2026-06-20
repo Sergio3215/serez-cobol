@@ -10,9 +10,9 @@
 
 use permissions { OS, File, Env }
 
-let names = ["hello", "control", "invoice", "table", "payroll", "gotodemo",
-             "thrudemo", "features", "report", "fixed", "payroll_batch",
-             "copydemo", "batch"];
+let names = ["hello", "control", "invoice", "table", "strings", "payroll",
+             "gotodemo", "thrudemo", "features", "report", "fixed",
+             "payroll_batch", "copydemo", "batch", "fileio"];
 
 fn runSz(string f) {
     let r = null;

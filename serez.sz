@@ -13,6 +13,26 @@ use permissions { File, Env }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 fn string cobName(string s) { return s.replaceAll("_", "-"); }
+fn string szName(string s) { return s.replaceAll("-", "_"); }
+
+// indexOf starting at `start` (serez indexOf takes no start position).
+fn int idxFrom(string s, string sub, int start) {
+    let p = s.substring(start).indexOf(sub);
+    if (p < 0) { return -1; }
+    return start + p;
+}
+
+// last index of `sub` in `s` (serez has no lastIndexOf).
+fn int lastIdx(string s, string sub) {
+    let res = -1;
+    let i = 0;
+    let lim = s.length() - sub.length();
+    while (i <= lim) {
+        if (s.substring(i, i + sub.length()) == sub) { res = i; }
+        i = i + 1;
+    }
+    return res;
+}
 
 fn bool startsTrim(string line, string p) { return line.trim().startsWith(p); }
 
@@ -78,7 +98,7 @@ fn string stripWrappers(string e) {
     let sc = s.indexOf(").setScale(");
     if (sc >= 0 && s.startsWith("(")) {
         let body = s.substring(1, sc);            // "(EXPR) + 0m"
-        let plus = body.lastIndexOf("+ 0m");
+        let plus = lastIdx(body, "+ 0m");
         if (plus >= 0) { body = body.substring(0, plus); }
         return stripWrappers(unwrap(body.trim()));
     }
@@ -117,6 +137,14 @@ fn string revTokens(string e) {
         let c = e[i];
         if (inStr) { out2 = out2 + c; if (c == "\"") { inStr = false; } i = i + 1; continue; }
         if (c == "\"") { inStr = true; out2 = out2 + c; i = i + 1; continue; }
+        if ("0123456789".includes(c)) {
+            // a numeric literal; drop a trailing dec suffix 'm' (0.21m → 0.21)
+            let num = "";
+            while (i < n && "0123456789.".includes(e[i])) { num = num + e[i]; i = i + 1; }
+            if (i < n && e[i] == "m") { i = i + 1; }
+            out2 = out2 + num;
+            continue;
+        }
         if ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz_".includes(c)) {
             let w = "";
             while (i < n && "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_".includes(e[i])) { w = w + e[i]; i = i + 1; }
@@ -222,9 +250,29 @@ if (file == "") {
 
     // 1. reconstruct the source halves from //@ annotations
     let pre = "";
+    let fdFile = [];        // FD file → its 01 record name (for WRITE)
+    let fdRec = [];
+    let lastFd = "";
     for (let raw in lines) {
         let t = raw.replaceAll("\r", "").trim();
-        if (t.startsWith("//@")) { pre = pre + t.substring(3).trim() + "\n"; }
+        if (t.startsWith("//@")) {
+            let a = t.substring(3).trim();
+            pre = pre + a + "\n";
+            let au = a.toUpperCase();
+            if (au.startsWith("FD ")) {
+                lastFd = a.substring(3).trim();
+                let fsp = lastFd.indexOf(" ");
+                if (fsp >= 0) { lastFd = lastFd.substring(0, fsp); }
+                if (lastFd.endsWith(".")) { lastFd = lastFd.substring(0, lastFd.length() - 1); }
+            }
+            else if (au.startsWith("01 ") && lastFd != "") {
+                let rest = a.substring(3).trim();
+                let sp = rest.indexOf(" ");
+                if (sp < 0) { sp = rest.length(); }
+                fdFile.push(szName(lastFd)); fdRec.push(rest.substring(0, sp));
+                lastFd = "";
+            }
+        }
     }
 
     // 2. translate the procedure
@@ -233,6 +281,7 @@ if (file == "") {
     let closes = [];        // stack of strings to emit on each '}'
     let tmpName = [];       // COMPUTE multi-receiver temps (__cN = expr)
     let tmpExpr = [];
+    let readEof = "";       // when in a READ, the __eofN variable of that READ
     let i = 0;
     let nL = lines.length();
     while (i < nL) {
@@ -264,6 +313,20 @@ if (file == "") {
             let m = closes.pop();
             let dot0 = "";
             if (closes.length() == 0) { dot0 = "."; }
+            if (m == "RCLAUSE") {
+                // end of a READ AT END / NOT AT END clause body; emit END-READ
+                // unless another clause for this READ follows immediately.
+                let nx = "";
+                if (i < nL) { nx = lines[i].replaceAll("\r", "").trim(); }
+                let more = nx.startsWith("if (" + readEof + r") {") || nx.startsWith("if (!" + readEof + r") {");
+                if (!more) {
+                    let d3 = "";
+                    if (closes.length() == 0) { d3 = "."; }
+                    body = body + ind + "END-READ" + d3 + "\n";
+                    readEof = "";
+                }
+                continue;
+            }
             if (m == "PERF") {
                 body = body + ind + "END-PERFORM" + dot0 + "\n";
             } else {
@@ -294,6 +357,20 @@ if (file == "") {
             continue;
         }
 
+        // READ start (must precede the generic `let __` skip):
+        //   let __eofN = (F_idx >= F_lines.length());
+        if (t.startsWith("let __eof") && t.includes("_idx >=")) {
+            let ev = t.substring(4, t.indexOf(" = "));            // __eofN
+            let p = t.indexOf("(") + 1;
+            let fvar = t.substring(p, idxFrom(t, "_idx", p));     // F
+            if (i < nL && lines[i].replaceAll("\r", "").trim().startsWith("if (!" + ev + ")")) {
+                i = i + 1;   // consume one-line read body
+            }
+            body = body + ind + "READ " + cobName(fvar) + "\n";
+            readEof = ev;
+            continue;
+        }
+
         // PERFORM <n> TIMES  (lowered: let __n=..; let __p=0; while(__p<__n){ ... __p=__p+1; })
         if (t.startsWith("let __n") && i + 1 < nL) {
             let eqp = t.indexOf("= ");
@@ -307,6 +384,26 @@ if (file == "") {
                 i = i + 2;   // consume the let __p and while lines
                 continue;
             }
+        }
+        // UNSTRING:  let __uN = (SRC).split(DELIM);  +  WS = (k < __uN.length()) ? __uN[k] : "";
+        if (t.startsWith("let __u") && t.includes(").split(")) {
+            let uname = t.substring(4, t.indexOf(" = "));
+            let p1 = t.indexOf("= (") + 3;
+            let p2 = t.indexOf(").split(");
+            let src = t.substring(p1, p2);
+            let d1 = p2 + 8;                              // after ").split("
+            let delim = t.substring(d1, idxFrom(t, ")", d1));
+            let targets = "";
+            while (i < nL) {
+                let nx = lines[i].replaceAll("\r", "").trim();
+                if (nx.includes("? " + uname + "[") && nx.includes(" = ")) {
+                    targets = targets + " " + cobName(nx.substring(0, nx.indexOf(" = ")).trim());
+                    i = i + 1;
+                } else { break; }
+            }
+            let du = ""; if (closes.length() == 0) { du = "."; }
+            body = body + ind + "UNSTRING " + revArith(src) + " DELIMITED BY " + delim + " INTO" + targets + du + "\n";
+            continue;
         }
         // COMPUTE multi-receiver temp: let __cN = EXPR;  → remember EXPR
         if (t.startsWith("let __c") && t.includes(" = ") && t.endsWith(";")) {
@@ -324,12 +421,30 @@ if (file == "") {
             // __goto = "X"; return;  → GO TO X
             if (t.includes("return")) {
                 let q1 = t.indexOf("\"");
-                let q2 = t.indexOf("\"", q1 + 1);
+                let q2 = idxFrom(t, "\"", q1 + 1);
                 let target = t.substring(q1 + 1, q2);
                 let dot0 = "";
                 if (closes.length() == 0) { dot0 = "."; }
                 body = body + ind + "GO TO " + cobName(target) + dot0 + "\n";
             }
+            continue;
+        }
+
+        // ── file I/O ──────────────────────────────────────────────────────────
+        // (READ start is handled earlier, before the `let __` skip.)
+        // READ clauses (only while a READ is open)
+        if (readEof != "" && t.startsWith("if (" + readEof + r") {")) {
+            body = body + ind + "AT END\n"; closes.push("RCLAUSE"); continue;
+        }
+        if (readEof != "" && t.startsWith("if (!" + readEof + r") {")) {
+            body = body + ind + "NOT AT END\n"; closes.push("RCLAUSE"); continue;
+        }
+        // CLOSE (output file):  File.write(<path>, <F>_out);
+        if (t.startsWith("File.write(") && t.includes("_out);")) {
+            let ap = lastIdx(t, ", ") + 2;
+            let ov = t.substring(ap, t.length() - 2);             // F_out
+            let dot0 = ""; if (closes.length() == 0) { dot0 = "."; }
+            body = body + ind + "CLOSE " + cobName(ov.substring(0, ov.length() - 4)) + dot0 + "\n";
             continue;
         }
 
@@ -369,6 +484,76 @@ if (file == "") {
             let lhs = t.substring(0, eq).trim();
             let rhs = t.substring(eq + 3, t.length() - 1).trim();
             let bare = stripWrappers(unwrap(rhs));
+
+            // ── file I/O assignment shapes ──────────────────────────────────
+            if (lhs.endsWith("_out") && rhs == "\"\"") {        // OPEN OUTPUT F
+                body = body + ind + "OPEN OUTPUT " + cobName(lhs.substring(0, lhs.length() - 4)) + dot + "\n";
+                continue;
+            }
+            if (lhs.endsWith("_out") && rhs.includes("+ (\"\" + ")) {   // WRITE [FROM]
+                let r1 = rhs.indexOf("+ (\"\" + ") + 8;
+                let r2 = idxFrom(rhs, ")", r1);
+                let src = revArith(rhs.substring(r1, r2));
+                let fbase = lhs.substring(0, lhs.length() - 4);   // F
+                let rec = "";
+                let fi = 0;
+                while (fi < fdFile.length()) { if (fdFile[fi] == fbase) { rec = fdRec[fi]; } fi = fi + 1; }
+                if (rec == "" || rec == src) { body = body + ind + "WRITE " + src + dot + "\n"; }
+                else { body = body + ind + "WRITE " + rec + " FROM " + src + dot + "\n"; }
+                continue;
+            }
+            if (lhs.endsWith("_lines") && rhs.includes("File.read(")) {   // OPEN INPUT F
+                if (i < nL && lines[i].replaceAll("\r", "").trim().startsWith(lhs.substring(0, lhs.length() - 6) + "_idx = 0")) {
+                    i = i + 1;       // consume the F_idx = 0; line
+                }
+                body = body + ind + "OPEN INPUT " + cobName(lhs.substring(0, lhs.length() - 6)) + dot + "\n";
+                continue;
+            }
+            if (lhs.endsWith("_idx")) { continue; }   // stray index reset
+
+            // ── string verbs ────────────────────────────────────────────────
+            if (rhs.includes(".substring(")) {        // reference modification → MOVE
+                let sp = rhs.indexOf(".substring(");
+                let srcv = rhs.substring(0, sp);
+                let args = splitTop(rhs.substring(sp + 11, rhs.length() - 1), ",");
+                let pe = args[0];                       // (P) - 1
+                if (pe.endsWith("- 1")) { pe = pe.substring(0, pe.length() - 3).trim(); }
+                let pos1 = unwrap(pe);
+                let le = args[1];                       // ((P)-1) + (LEN)
+                let lp = lastIdx(le, "+ ");
+                let lenv = unwrap(le.substring(lp + 2));
+                body = body + ind + "MOVE " + revArith(srcv) + "(" + revArith(pos1) + ":" + revArith(lenv) + ") TO " + revArith(lhs) + dot + "\n";
+                continue;
+            }
+            if (rhs.includes(".replaceAll(")) {        // INSPECT REPLACING
+                let rp = rhs.indexOf(".replaceAll(");
+                let args = splitTop(rhs.substring(rp + 12, rhs.length() - 1), ",");
+                body = body + ind + "INSPECT " + revArith(lhs) + " REPLACING ALL " + args[0].trim() + " BY " + args[1].trim() + dot + "\n";
+                continue;
+            }
+            if (rhs.includes(").split(") && rhs.includes(".length()")) {   // INSPECT TALLYING
+                let q1 = rhs.indexOf("= (");
+                let q1b = rhs.indexOf("(") + 1;
+                let p2 = rhs.indexOf(").split(");
+                let srcv = rhs.substring(q1b, p2);
+                let d1 = p2 + 8;
+                let needle = rhs.substring(d1, idxFrom(rhs, ")", d1));
+                body = body + ind + "INSPECT " + revArith(srcv) + " TALLYING " + revArith(lhs) + " FOR ALL " + needle + dot + "\n";
+                continue;
+            }
+            // STRING: concatenation of >1 parts that include a string literal
+            let parts = splitPlus(rhs);
+            if (parts.length() > 1) {
+                let hasStr = false;
+                for (let pp in parts) { if (pp.startsWith("\"")) { hasStr = true; } }
+                if (hasStr) {
+                    let s = "STRING ";
+                    for (let pp in parts) { s = s + revArith(pp) + " DELIMITED BY SIZE "; }
+                    body = body + ind + s + "INTO " + revArith(lhs) + dot + "\n";
+                    continue;
+                }
+            }
+
             // is the RHS a COMPUTE multi-receiver temp (__cN)?
             let tExpr = "";
             let isTmp = false;
@@ -379,13 +564,13 @@ if (file == "") {
             }
             if (isTmp) {
                 // gather consecutive receivers sharing the same temp → one COMPUTE
-                let recv = cobName(lhs);
+                let recv = revArith(lhs);
                 while (i < nL) {
                     let nx = lines[i].replaceAll("\r", "").trim();
                     let e2 = nx.indexOf(" = ");
                     if (e2 > 0 && nx.endsWith(";")
                         && stripWrappers(unwrap(nx.substring(e2 + 3, nx.length() - 1).trim())) == bare) {
-                        recv = recv + " " + cobName(nx.substring(0, e2).trim());
+                        recv = recv + " " + revArith(nx.substring(0, e2).trim());
                         i = i + 1;
                     } else { break; }
                 }
@@ -393,9 +578,9 @@ if (file == "") {
                 continue;
             }
             if (isArithExpr(bare)) {
-                body = body + ind + "COMPUTE " + cobName(lhs) + " = " + revArith(rhs) + dot + "\n";
+                body = body + ind + "COMPUTE " + revArith(lhs) + " = " + revArith(rhs) + dot + "\n";
             } else {
-                body = body + ind + "MOVE " + revArith(rhs) + " TO " + cobName(lhs) + dot + "\n";
+                body = body + ind + "MOVE " + revArith(rhs) + " TO " + revArith(lhs) + dot + "\n";
             }
             continue;
         }
