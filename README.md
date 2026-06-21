@@ -85,6 +85,9 @@ and full file I/O) — **15/15 preserve behavior**.
   (computed), and `ALTER <para> TO PROCEED TO <target>` (runtime-mutable GO TO) —
   paragraphs run under a program-counter driver, so all of these plus fall-through
   and `STOP RUN` behave like COBOL. (`GO TO` inside a PERFORMed paragraph: not yet.)
+- `CALL "SUB" [USING a b c]` to a subprogram defined in the same file (separate
+  compilation units / `END PROGRAM`): the subprogram becomes a function, USING
+  args are passed and written back (COBOL BY REFERENCE) via a returned tuple.
 - Strings: reference modification `X(p:len)`, `STRING`, `UNSTRING`, `INSPECT TALLYING`/`REPLACING`.
 - Files (LINE SEQUENTIAL): `SELECT…ASSIGN`, `FD`, `OPEN`, `READ … AT END / NOT AT END … END-READ`,
   `WRITE [FROM]`, `CLOSE`.
@@ -110,8 +113,12 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 
 ## Not yet supported (roadmap)
 
-- `CALL` / nested programs (emitted as a comment — external subprograms can't be
-  auto-linked).
+- `CALL` to a subprogram in *another file* (only same-file units are linked) and
+  external system calls. Recursion / persisted subprogram state across calls.
+- **Round-trip** (`serez.sz`) of multi-program files: the forward direction
+  translates `CALL` + subprograms and runs correctly, but the reverse engine
+  rebuilds a single program (subprograms aren't re-emitted yet), so `call.cob` is
+  in the forward suite, not the round-trip suite.
 - `DISPLAY … WITH NO ADVANCING` is parsed but still prints a trailing newline
   (the core has no no-newline print without a Terminal permission).
 - `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
