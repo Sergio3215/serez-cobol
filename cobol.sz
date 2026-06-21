@@ -595,7 +595,44 @@ fn bool isStmtKw(string t) {
         || u == "GO" || u == "NEXT" || u == "STRING" || u == "UNSTRING"
         || u == "INSPECT" || u == "OPEN" || u == "READ" || u == "WRITE"
         || u == "CLOSE" || u == "END-READ" || u == "CALL" || u == "SET"
-        || u == "GOBACK" || u == "EXIT";
+        || u == "GOBACK" || u == "EXIT" || u == "ALTER";
+}
+
+// ALTER support: paragraphs named in an ALTER stmt have a runtime-mutable GO TO.
+// Returns "P=origTarget\n…" for each such paragraph (names szName'd).
+fn string collectAltered([string] toks) {
+    let n = toks.length();
+    let names = "";
+    let i = 0;
+    while (i < n) {
+        if (isWord(toks[i], "ALTER") && i + 1 < n && tkType(toks[i + 1]) == "W") {
+            names = names + "|" + szName(tkVal(toks[i + 1])) + "|";
+        }
+        i = i + 1;
+    }
+    if (names == "") { return ""; }
+    let entries = "";
+    i = 0;
+    let atStart = true;
+    while (i < n) {
+        if (isDot(toks[i])) { atStart = true; i = i + 1; continue; }
+        if (atStart && tkType(toks[i]) == "W" && !isStmtKw(toks[i]) && i + 1 < n && isDot(toks[i + 1])) {
+            let pnm = szName(tkVal(toks[i]));
+            if (names.includes("|" + pnm + "|")) {
+                let j = i + 2;
+                if (j < n && isWord(toks[j], "GO")) {
+                    j = j + 1;
+                    if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
+                    if (j < n) { entries = entries + pnm + "=" + szName(tkVal(toks[j])) + "\n"; }
+                }
+            }
+            i = i + 2;
+            continue;
+        }
+        atStart = false;
+        i = i + 1;
+    }
+    return entries;
 }
 
 // End of an operand/target list: a statement boundary, or an inline-clause word
@@ -784,6 +821,11 @@ fn string emitProcedure([string] toks, [string] vars) {
     let curBody = "";
     let paraOrder = "";
     let paras = collectParagraphs(toks);   // ordered paragraph names (for PERFORM THRU)
+    let alteredEntries = collectAltered(toks);   // "P=orig\n…" for ALTERed paragraphs
+    let alteredNames = "";                       // "|P|P2|" set used by the GO handler
+    for (let e in alteredEntries.split("\n")) {
+        if (e != "") { alteredNames = alteredNames + "|" + e.split("=")[0] + "|"; }
+    }
     let curEof = "";       // eof flag var of the current READ (for AT END / NOT AT END)
     let closeStack = [];   // close-text per open block (for END-x and '.')
     let evalSubj = [];     // parallel: EVALUATE subject ("" for non-eval blocks)
@@ -1016,14 +1058,14 @@ fn string emitProcedure([string] toks, [string] vars) {
                 }
             }
             // out-of-line PERFORM <para> [...]
-            let r = emitStmt(toks, i, vars, ind, paras);
+            let r = emitStmt(toks, i, vars, ind, paras, curName, alteredNames);
             curBody = curBody + r[1];
             if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
             continue;
         }
 
         // leaf statement
-        let r = emitStmt(toks, i, vars, ind, paras);
+        let r = emitStmt(toks, i, vars, ind, paras, curName, alteredNames);
         curBody = curBody + r[1];
         if (r[0] <= i) { i = i + 1; } else { i = r[0]; }
     }
@@ -1063,7 +1105,15 @@ fn string emitProcedure([string] toks, [string] vars) {
         driver = driver + "    " + r"}" + "\n";
         driver = driver + r"}" + "\n";
     }
-    return "let __goto = \"\";\n\n" + funcs + "// ── main ──\n" + mainCalls + driver;
+    // mutable GO TO targets for ALTERed paragraphs (init to their original target)
+    let altDecls = "";
+    for (let e in alteredEntries.split("\n")) {
+        if (e != "") {
+            let pr = e.split("=");
+            altDecls = altDecls + "let __alt_" + pr[0] + " = \"" + pr[1] + "\";\n";
+        }
+    }
+    return "let __goto = \"\";\n" + altDecls + "\n" + funcs + "// ── main ──\n" + mainCalls + driver;
 }
 
 // PERFORM VARYING v FROM a BY b UNTIL c [AFTER w FROM .. BY .. UNTIL ..]  →
@@ -1123,7 +1173,7 @@ fn string performBody(string paras, string p1, string p2, string ind) {
     return performRange(paras, p1, p2, ind);
 }
 
-fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string paras) {
+fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string paras, string curPara, string altered) {
     let n = toks.length();
     let t = toks[pos];
     if (tkType(t) != "W") { return [pos + 1, ""]; }
@@ -1368,12 +1418,43 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
     }
 
     if (kw == "GO") {
-        // GO TO <para>  (DEPENDING ON not supported yet)
+        // GO TO <para>  |  GO TO p1 p2 .. pn DEPENDING ON idx  (1-based computed)
         let j = pos + 1;
         if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
-        let target = szName(tkVal(toks[j]));
+        let targets = [];
+        while (j < n && tkType(toks[j]) == "W" && !isWord(toks[j], "DEPENDING") && !isDot(toks[j])) {
+            targets.push(szName(tkVal(toks[j]))); j = j + 1;
+        }
+        if (j < n && isWord(toks[j], "DEPENDING")) {
+            j = j + 1;
+            if (j < n && isWord(toks[j], "ON")) { j = j + 1; }
+            let r = emitRef(toks, j, vars); let idx = r[1]; j = r[0];
+            // jump to the kth paragraph when idx == k; fall through if out of range
+            let code = "";
+            let k = 0;
+            while (k < targets.length()) {
+                code = code + ind + "if (" + idx + " == " + (k + 1) + ") " + r"{" + " __goto = \"" + targets[k] + "\"; return; " + r"}" + "\n";
+                k = k + 1;
+            }
+            return [j, code];
+        }
+        // alterable GO TO: the target lives in a mutable __alt_<para> variable
+        if (altered.includes("|" + curPara + "|")) {
+            return [j, ind + "__goto = __alt_" + curPara + "; return;\n"];
+        }
+        return [j, ind + "__goto = \"" + targets[0] + "\"; return;\n"];
+    }
+
+    if (kw == "ALTER") {
+        // ALTER <para> TO PROCEED TO <target>  →  __alt_<para> = "<target>";
+        let p = szName(tkVal(toks[pos + 1]));
+        let j = pos + 2;
+        while (j < n && !isWord(toks[j], "PROCEED") && !isDot(toks[j])) { j = j + 1; }
+        if (j < n && isWord(toks[j], "PROCEED")) { j = j + 1; }
+        if (j < n && isWord(toks[j], "TO")) { j = j + 1; }
+        let tgt = szName(tkVal(toks[j]));
         j = j + 1;
-        return [j, ind + "__goto = \"" + target + "\"; return;\n"];
+        return [j, ind + "__alt_" + p + " = \"" + tgt + "\";\n"];
     }
 
     if (kw == "CONTINUE" || kw == "NEXT") {

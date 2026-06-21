@@ -280,6 +280,18 @@ if (file == "") {
         }
     }
 
+    // ALTER: map each __alt_<P> global to its original GO TO target
+    let altP = [];
+    let altOrig = [];
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("let __alt_") && t.includes(" = \"")) {
+            let nm = t.substring(10, t.indexOf(" = "));
+            let q = t.indexOf("\"") + 1;
+            altP.push(nm); altOrig.push(t.substring(q, idxFrom(t, "\"", q)));
+        }
+    }
+
     // 2. translate the procedure
     let body = "";
     let inFn = false;
@@ -422,7 +434,27 @@ if (file == "") {
 
         // increment line of a lowered TIMES loop: __pN = __pN + 1;
         if (t.startsWith("__p") && t.includes("= __p")) { continue; }
+        // ALTER target reassignment:  __alt_P = "Y";  → ALTER P TO PROCEED TO Y
+        if (t.startsWith("__alt_") && t.includes(" = \"")) {
+            let p = t.substring(6, t.indexOf(" = "));
+            let q = t.indexOf("\"") + 1;
+            let y = t.substring(q, idxFrom(t, "\"", q));
+            let da = ""; if (closes.length() == 0) { da = "."; }
+            body = body + ind + "ALTER " + cobName(p) + " TO PROCEED TO " + cobName(y) + da + "\n";
+            continue;
+        }
         if (t.startsWith("__goto")) {
+            // alterable GO TO:  __goto = __alt_P; return;  → GO TO <P's original target>
+            if (t.includes("__alt_")) {
+                let ap = t.indexOf("__alt_") + 6;
+                let pnm = t.substring(ap, idxFrom(t, ";", ap));
+                let orig = pnm;
+                let z = 0;
+                while (z < altP.length()) { if (altP[z] == pnm) { orig = altOrig[z]; } z = z + 1; }
+                let dg = ""; if (closes.length() == 0) { dg = "."; }
+                body = body + ind + "GO TO " + cobName(orig) + dg + "\n";
+                continue;
+            }
             // __goto = "X"; return;  → GO TO X
             if (t.includes("return")) {
                 let q1 = t.indexOf("\"");
@@ -432,6 +464,26 @@ if (file == "") {
                 if (closes.length() == 0) { dot0 = "."; }
                 body = body + ind + "GO TO " + cobName(target) + dot0 + "\n";
             }
+            continue;
+        }
+        // computed GO TO ... DEPENDING ON: consecutive single-line
+        //   if (IDX == k) { __goto = "Pk"; return; }
+        if (t.startsWith("if (") && t.includes("__goto = ") && t.endsWith(r"}")) {
+            let cp = t.indexOf(") ");
+            let cond = t.substring(4, cp);            // IDX == k
+            let idx = cond.substring(0, cond.indexOf(" == ")).trim();
+            let gq = t.indexOf("__goto = \"") + 10;
+            let tgts = cobName(t.substring(gq, idxFrom(t, "\"", gq)));
+            while (i < nL) {
+                let nx = lines[i].replaceAll("\r", "").trim();
+                if (nx.startsWith("if (" + idx + " == ") && nx.includes("__goto = ") && nx.endsWith(r"}")) {
+                    let g = nx.indexOf("__goto = \"") + 10;
+                    tgts = tgts + " " + cobName(nx.substring(g, idxFrom(nx, "\"", g)));
+                    i = i + 1;
+                } else { break; }
+            }
+            let dotd = ""; if (closes.length() == 0) { dotd = "."; }
+            body = body + ind + "GO TO " + tgts + " DEPENDING ON " + cobName(idx) + dotd + "\n";
             continue;
         }
 

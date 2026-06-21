@@ -81,9 +81,10 @@ and full file I/O) — **15/15 preserve behavior**.
   `EVALUATE a ALSO b … WHEN v1 ALSO v2 … WHEN … ALSO ANY …`.
 - `PERFORM <para> [THRU <para2>]`, `… <n|var> TIMES | UNTIL c | VARYING v FROM a BY b
   UNTIL c [AFTER w FROM … UNTIL …]`, and inline `PERFORM … END-PERFORM`.
-- `GO TO <para>` (forward skip and backward loops) — paragraphs run under a
-  program-counter driver, so `GO TO`, fall-through and `STOP RUN` all behave like
-  COBOL. (`GO TO … DEPENDING ON` and `GO TO` inside a PERFORMed paragraph: not yet.)
+- `GO TO <para>` (forward skip and backward loops), `GO TO p1 p2 … DEPENDING ON i`
+  (computed), and `ALTER <para> TO PROCEED TO <target>` (runtime-mutable GO TO) —
+  paragraphs run under a program-counter driver, so all of these plus fall-through
+  and `STOP RUN` behave like COBOL. (`GO TO` inside a PERFORMed paragraph: not yet.)
 - Strings: reference modification `X(p:len)`, `STRING`, `UNSTRING`, `INSPECT TALLYING`/`REPLACING`.
 - Files (LINE SEQUENTIAL): `SELECT…ASSIGN`, `FD`, `OPEN`, `READ … AT END / NOT AT END … END-READ`,
   `WRITE [FROM]`, `CLOSE`.
@@ -110,7 +111,7 @@ All amounts use exact `dec` arithmetic, so results match a COBOL runtime.
 ## Not yet supported (roadmap)
 
 - `CALL` / nested programs (emitted as a comment — external subprograms can't be
-  auto-linked); `GO TO … DEPENDING ON`; `ALTER`.
+  auto-linked).
 - `DISPLAY … WITH NO ADVANCING` is parsed but still prints a trailing newline
   (the core has no no-newline print without a Terminal permission).
 - `REDEFINES` / byte-overlay, `COMP-3` / `COMP` packed/binary, EBCDIC.
