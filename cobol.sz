@@ -1139,13 +1139,32 @@ fn [any] emitStmt([string] toks, int pos, [string] vars, string ind, string para
             dstLhs.push(rl[1]); dstBase.push(rl[2]); j = rl[0];
         }
         if (j < n && tkType(toks[j]) == "O" && tkVal(toks[j]) == "=") { j = j + 1; }
-        let expr = "";
+        let pieces = [];
+        let pieceOpnd = [];
         let rounded = false;
         while (j < n && !isStmtKw(toks[j]) && !isDot(toks[j])) {
             if (isWord(toks[j], "ROUNDED")) { rounded = true; j = j + 1; continue; }
+            let tj = toks[j];
             let r = emitRef(toks, j, vars);
-            expr = expr + r[1] + " ";
+            pieces.push(r[1]);
+            pieceOpnd.push(tkType(tj) == "W" || tkType(tj) == "N" || tkType(tj) == "D" || tkType(tj) == "S");
             j = r[0];
+        }
+        // COBOL computes a division at the result field's precision: if the target
+        // is dec and the expression divides, do the arithmetic in dec (lift each
+        // operand with + 0m) so e.g. 104 / 6 → 17.33, not integer 17.
+        let liftDec = false;
+        if (dstBase.length() > 0 && varKind(vars, dstBase[0]) == "dec") {
+            let h = 0;
+            while (h < pieces.length()) { if (pieces[h] == "/") { liftDec = true; } h = h + 1; }
+        }
+        let expr = "";
+        let h2 = 0;
+        while (h2 < pieces.length()) {
+            let p = pieces[h2];
+            if (liftDec && pieceOpnd[h2]) { p = "(" + p + " + 0m)"; }
+            expr = expr + p + " ";
+            h2 = h2 + 1;
         }
         let code = "";
         let src = expr.trim();

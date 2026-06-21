@@ -190,7 +190,9 @@ fn string revSub(string e) {
 
 // arithmetic expression → COBOL (strip dec wrappers, subscripts, names mapped)
 fn string revArith(string e) {
-    return revTokens(revSub(stripWrappers(unwrap(e))));
+    let s = stripWrappers(unwrap(e));
+    s = s.replaceAll(" + 0m", "");   // remove dec-lift artifacts on operands
+    return revTokens(revSub(s));
 }
 
 // a single operand (no arithmetic) → MOVE source; else COMPUTE.

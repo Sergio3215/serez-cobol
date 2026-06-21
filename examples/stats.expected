@@ -1,0 +1,9 @@
+sorted:
+  4
+  8
+  11
+  16
+  23
+  42
+min=4 max=42 avg=17.33
+found 42 at pos 6

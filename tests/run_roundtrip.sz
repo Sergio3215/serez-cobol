@@ -13,7 +13,7 @@ use permissions { OS, File, Env }
 let names = ["hello", "control", "invoice", "table", "strings", "payroll",
              "gotodemo", "thrudemo", "features", "report", "fixed",
              "payroll_batch", "copydemo", "batch", "fileio",
-             "inventory", "parser"];
+             "inventory", "parser", "stats"];
 
 fn runSz(string f) {
     let r = null;
