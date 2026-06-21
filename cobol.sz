@@ -887,12 +887,22 @@ fn string emitProcedure([string] toks, [string] vars) {
         }
 
         if (kw == "EVALUATE") {
-            // subject: TRUE → conditions per WHEN; else value compared per WHEN
-            let subj = "";
-            if (isWord(toks[i + 1], "TRUE")) { subj = "TRUE"; i = i + 2; }
-            else { let r = grabExpr(toks, i + 1, vars, ""); subj = r[1]; i = r[0]; }
+            // one or more ALSO-separated subjects (decision table). "TRUE" subjects
+            // take conditions per WHEN; value subjects compare per WHEN. Multiple
+            // subjects are stored joined with "~|~".
+            let subs = "";
+            let p = i + 1;
+            let go = true;
+            while (go) {
+                let s1 = "";
+                if (isWord(toks[p], "TRUE")) { s1 = "TRUE"; p = p + 1; }
+                else { let r = grabExpr(toks, p, vars, "ALSO"); s1 = r[1]; p = r[0]; }
+                if (subs == "") { subs = s1; } else { subs = subs + "~|~" + s1; }
+                if (p < n && isWord(toks[p], "ALSO")) { p = p + 1; } else { go = false; }
+            }
+            i = p;
             closeStack.push(ind + "" + r"}" + "\n");
-            evalSubj.push(subj);
+            evalSubj.push(subs);
             evalSeen.push("");
             continue;
         }
@@ -907,6 +917,37 @@ fn string emitProcedure([string] toks, [string] vars) {
             let seen = evalSeen[top];
             let lead = "} else if";
             if (seen == "") { lead = "if"; evalSeen[top] = "1"; }
+
+            // multi-subject (ALSO) decision table: cells ANDed across subjects
+            if (subj.includes("~|~")) {
+                let subjects = subj.split("~|~");
+                let cond = "";
+                let k = i + 1;
+                let ci = 0;
+                while (ci < subjects.length()) {
+                    let s = subjects[ci];
+                    let cell = "";
+                    if (isWord(toks[k], "ANY")) { cell = "true"; k = k + 1; }
+                    else if (s == "TRUE") {
+                        let r = grabCond(toks, k, vars, "ALSO"); cell = "(" + r[1] + ")"; k = r[0];
+                    } else {
+                        let r1 = emitRef(toks, k, vars); let v1 = r1[1]; k = r1[0];
+                        if (k < n && (isWord(toks[k], "THRU") || isWord(toks[k], "THROUGH"))) {
+                            let r2 = emitRef(toks, k + 1, vars);
+                            cell = "(" + s + " >= " + v1 + " && " + s + " <= " + r2[1] + ")"; k = r2[0];
+                        } else {
+                            cell = "(" + s + " == " + v1 + ")";
+                        }
+                    }
+                    if (cond == "") { cond = cell; } else { cond = cond + " && " + cell; }
+                    ci = ci + 1;
+                    if (ci < subjects.length() && k < n && isWord(toks[k], "ALSO")) { k = k + 1; }
+                }
+                curBody = curBody + ind + lead + " (" + cond + ") " + r"{" + "\n";
+                i = k;
+                continue;
+            }
+
             // merge consecutive "WHEN a WHEN b ..." (no body between) into one OR
             let cond = "";
             let k = i + 1;

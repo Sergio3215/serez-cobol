@@ -77,7 +77,8 @@ and full file I/O) — **15/15 preserve behavior**.
   `ADD`/`SUBTRACT`/`MULTIPLY`/`DIVIDE` with `TO/FROM/BY/INTO/GIVING [ROUNDED]`,
   `DIVIDE … REMAINDER`, and **multiple receivers** (`ADD 1 TO a b c`).
 - `IF / ELSE / END-IF`; `EVALUATE … WHEN [v | v THRU w | a WHEN b] … WHEN OTHER …`
-  (subject value, or `EVALUATE TRUE`).
+  (subject value, or `EVALUATE TRUE`); multi-subject decision tables
+  `EVALUATE a ALSO b … WHEN v1 ALSO v2 … WHEN … ALSO ANY …`.
 - `PERFORM <para> [THRU <para2>]`, `… <n|var> TIMES | UNTIL c | VARYING v FROM a BY b
   UNTIL c [AFTER w FROM … UNTIL …]`, and inline `PERFORM … END-PERFORM`.
 - `GO TO <para>` (forward skip and backward loops) — paragraphs run under a
@@ -137,8 +138,11 @@ Highlights: `features.cob` (v2.0 control-flow/condition showcase), `batch.cob`
 `inventory.cob` (tables + dec + file I/O + STRING + EVALUATE ranges + 2-D PERFORM
 VARYING…AFTER + class test + PIC editing) and `parser.cob` (UNSTRING + numeric
 conversion + DIVIDE REMAINDER + `**` + INSPECT + ref-mod + GO TO + implied
-subject + SET). `run_roundtrip.sz` verifies all 17 survive a full
-COBOL→sz→COBOL→sz cycle with identical behavior.
+subject + SET); plus two algorithmic ones — `stats.cob` (bubble sort + linear
+search + min/max/decimal average) and `decision.cob` (string reversal with a
+negative-step `PERFORM VARYING` + an `EVALUATE … ALSO` decision table).
+`run_roundtrip.sz` verifies all 19 survive a full COBOL→sz→COBOL→sz cycle with
+identical behavior.
 
 ## Layout
 

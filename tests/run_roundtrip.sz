@@ -5,15 +5,15 @@
 //   sz tests/run_roundtrip.sz        # from the repo root
 //
 // It works on temp copies (~rt.*) and never writes the examples/*.cob originals.
-// STRING/UNSTRING/INSPECT/reference-modification (strings.cob) and file I/O
-// (fileio.cob) do not reverse to COBOL verbs yet, so they are excluded.
+// Every example is covered (STRING/UNSTRING/INSPECT/ref-mod and file I/O reverse
+// to COBOL verbs too); the round-trip preserves behavior, not byte-for-byte text.
 
 use permissions { OS, File, Env }
 
 let names = ["hello", "control", "invoice", "table", "strings", "payroll",
              "gotodemo", "thrudemo", "features", "report", "fixed",
              "payroll_batch", "copydemo", "batch", "fileio",
-             "inventory", "parser", "stats"];
+             "inventory", "parser", "stats", "decision"];
 
 fn runSz(string f) {
     let r = null;
