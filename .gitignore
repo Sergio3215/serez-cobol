@@ -5,3 +5,5 @@ examples/*.sz
 ~*
 # Data files produced by file-I/O examples
 *.dat
+*.ps1
+*.sh
