@@ -19,13 +19,22 @@ WS_TAX = ((WS_SUBTOTAL * 0.21m) + 0m).setScale(2, "half-up");
 
 ## Usage
 
-`index.sz` is the single entry point. It decides the direction from the input
-file extension — there are no sub-commands:
+Once installed (`sz install serez-cobol`), the package exposes a single
+`convert` command via `sz run`. It decides the direction from the input file
+extension — there are no sub-commands:
 
 ```sh
-sz index.sz program.cob       # .cob/.cbl → COBOL → Serez (.sz)     [cobol.sz]
-sz index.sz program.sz        # .sz       → Serez → COBOL (.cob)     [serez.sz]
-sz index.sz notes.txt         # anything else → a clear error
+sz run convert program.cob    # .cob/.cbl → COBOL → Serez (.sz)     [cobol.sz]
+sz run convert program.sz     # .sz       → Serez → COBOL (.cob)     [serez.sz]
+sz run convert notes.txt      # anything else → a clear error
+```
+
+`sz run convert` forwards the file to the entry point (`index.sz`), which
+locates its engines next to itself. Running the entry directly also works —
+handy inside the repo:
+
+```sh
+sz index.sz program.cob       # same routing, run from the repo
 ```
 
 You can also run the engines directly:

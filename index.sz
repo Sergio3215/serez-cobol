@@ -1,23 +1,30 @@
 // index — the single entry point for serez-cobol.
 // Decides the direction purely from the input file extension and runs the
-// matching engine. There are no sub-commands: just `sz index.sz <file>`.
+// matching engine. There are no sub-commands, just an input file.
 //
 //   <file>.cob / .cbl  → cobol.sz   (COBOL → Serez .sz)
 //   <file>.sz          → serez.sz   (Serez .sz → COBOL)
 //   anything else      → error
 //
+// Installed as a package (recommended):
+//   sz run convert path/to/program.cob
+//   sz run convert path/to/program.sz
+// Or run the entry directly from the repo:
 //   sz index.sz path/to/program.cob
-//   sz index.sz path/to/program.sz
 
 use permissions { OS, Env, File }
 
-// the input file is the first argument after this script
+// Find the input file (first argument after this script) AND this script's own
+// path, so the engine (cobol.sz/serez.sz) is resolved NEXT TO index.sz — not
+// relative to the caller's CWD (which differs under `sz run convert`).
 let file = "";
+let scriptPath = "";
 let past = false;
 for (let a in Env.args()) {
     if (past) {
         if (file == "") { file = a; }
     } else if (a.toLowerCase().endsWith("index.sz")) {
+        scriptPath = a;
         past = true;
     }
 }
@@ -28,13 +35,27 @@ if (low.endsWith(".cob") || low.endsWith(".cbl")) { engine = "cobol.sz"; }
 else if (low.endsWith(".sz")) { engine = "serez.sz"; }
 
 if (file == "") {
-    out "usage: sz index.sz <file.cob | file.sz>";
+    out "usage: sz run convert <file.cob | file.sz>";
 } else if (engine == "") {
     out "ERROR: '" + file + "' is not a COBOL or Serez source.";
     out "Pass a .cob/.cbl (COBOL) file to translate to Serez, or a .sz file to translate to COBOL.";
 } else {
+    // Directory of index.sz (works whether the path uses \ or /). If there is
+    // no directory component (bare "index.sz" run from the repo), fall back to
+    // the plain engine name (CWD-relative), preserving the old behavior.
+    let dir = "";
+    let norm = scriptPath.replaceAll("\\", "/");
+    let parts = norm.split("/");
+    let i = 0;
+    while (i < parts.length() - 1) {
+        if (dir == "") { dir = parts[i]; } else { dir = dir + "/" + parts[i]; }
+        i = i + 1;
+    }
+    let enginePath = engine;
+    if (dir != "") { enginePath = dir + "/" + engine; }
+
     let r = null;
-    unsafe { r = OS.exec("sz", [engine, file]); }
+    unsafe { r = OS.exec("sz", [enginePath, file]); }
     let so = r.stdout.trim();
     let se = r.stderr.trim();
     if (so != "") { out so; }
