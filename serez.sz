@@ -1164,6 +1164,24 @@ if (file == "") {
         let mrg = mergeAnnotations(mainLines, file);
         applySync(file, lines, sync, mrg[0], mrg[1]);
         let head = mrg[1];
+
+        // The main PROGRAM-ID comes from the file name, so `sumar.sz` holding a
+        // `fn Sumar` would emit two units called SUMAR and an ambiguous CALL.
+        let mainId = progIdFrom(file);
+        let pidAt = head.indexOf("PROGRAM-ID. ");
+        if (pidAt >= 0) {
+            let rest = head.substring(pidAt + 12);
+            let dotAt = rest.indexOf(".");
+            if (dotAt > 0) { mainId = rest.substring(0, dotAt).trim(); }
+        }
+        let clash = false;
+        for (let f in fns) { if (cobName(fnField(f, 0)).toUpperCase() == mainId) { clash = true; } }
+        if (clash) {
+            let newId = mainId + "-MAIN";
+            head = head.replaceAll("PROGRAM-ID. " + mainId + ".", "PROGRAM-ID. " + newId + ".");
+            mainId = newId;
+        }
+
         let gvars = inferVars(mainLines);
         for (let f in fns) {
             let fname = fnField(f, 0);
@@ -1186,7 +1204,7 @@ if (file == "") {
         let mainBody = plainBody(mainLines, 0, mainLines.length() - 1, fns, "", "           ");
         if (!mainBody.includes("STOP RUN")) { mainBody = mainBody + "           STOP RUN.\n"; }
         let text = head + "PROCEDURE DIVISION.\n" + upIdents(mainBody);
-        if (fns.length() > 0) { text = text + "END PROGRAM " + progIdFrom(file) + ".\n"; }
+        if (fns.length() > 0) { text = text + "END PROGRAM " + mainId + ".\n"; }
 
         // one subprogram per hand-written fn
         for (let f in fns) {
