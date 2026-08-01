@@ -1,0 +1,17 @@
+// Hand-written Serez: strings, a decimal, and two functions.
+
+fn int Doble(n) {
+    return n * 2;
+}
+
+fn Saludo(quien) {
+    return "hola " + quien;
+}
+
+let nombre = "mundo";
+let precio = 10.50m;
+let veces = Doble(21);
+
+out Saludo(nombre);
+out "veces: " + veces;
+out "precio: " + precio;

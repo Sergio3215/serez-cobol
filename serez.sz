@@ -240,15 +240,866 @@ fn string revCond(string e) {
     return s.trim();
 }
 
+// ── inference: rebuild the DATA DIVISION from the .sz itself ──────────────────
+// Used when the source carries no `//@` annotations (hand-written .sz, or one
+// produced with `clean`). What the annotations state exactly, this can only
+// approximate: widths come from the literals actually assigned, so a COBOL
+// `PIC X(20) VALUE "world"` infers back as `PIC X(5)`.
+//
+// Variable entry: "NAME|kind|scale|width|init"   (kind: int | dec | str)
+
+fn int braceDelta(string line) {
+    let d = 0;
+    let i = 0;
+    let inStr = false;
+    while (i < line.length()) {
+        let c = line[i];
+        if (inStr) { if (c == "\"") { inStr = false; } }
+        else if (c == "\"") { inStr = true; }
+        else if (c == r"{") { d = d + 1; }
+        else if (c == r"}") { d = d - 1; }
+        i = i + 1;
+    }
+    return d;
+}
+
+fn bool isDigits(string s) {
+    if (s == "") { return false; }
+    let i = 0;
+    while (i < s.length()) {
+        if (!"0123456789".includes(s[i])) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+// Classify a literal right-hand side → "kind|scale|width", or "?|0|0" when the
+// RHS is not a literal (a call or an expression: the type comes from elsewhere).
+fn string litKind(string rhs) {
+    let s = rhs.trim();
+    if (s.endsWith(";")) { s = s.substring(0, s.length() - 1).trim(); }
+    if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) {
+        return "str|0|" + (s.length() - 2);
+    }
+    let num = s;
+    if (num.startsWith("-")) { num = num.substring(1); }
+    if (num.endsWith("m")) { num = num.substring(0, num.length() - 1); }
+    let dot = num.indexOf(".");
+    if (dot >= 0) {
+        let ip = num.substring(0, dot);
+        let fp = num.substring(dot + 1);
+        if (isDigits(ip) && isDigits(fp)) { return "dec|" + fp.length() + "|" + ip.length(); }
+    } else if (isDigits(num)) {
+        return "int|0|" + num.length();
+    }
+    return "?|0|0";
+}
+
+fn string vfield(string entry, int idx) { return entry.split("|")[idx]; }
+
+// Walk the file: every top-level `let NAME = ...;` becomes a WORKING-STORAGE
+// item, then every assignment to it (at any depth) widens the inferred picture.
+fn [string] inferVars([string] lines) {
+    let names = [];
+    let kinds = [];
+    let scales = [];
+    let widths = [];
+    let inits = [];
+
+    let depth = 0;
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        let d0 = depth;
+        depth = depth + braceDelta(raw);
+        if (t.startsWith("//")) { continue; }
+        if (d0 != 0) { continue; }
+        if (!t.startsWith("let ")) { continue; }
+        let eq = t.indexOf(" = ");
+        if (eq < 0) { continue; }
+        let nm = t.substring(4, eq).trim();
+        if (nm.startsWith("__") || nm == "" || nm.includes(" ")) { continue; }
+        let already = false;
+        for (let e in names) { if (e == nm) { already = true; } }
+        if (already) { continue; }
+        let rhs = t.substring(eq + 3).trim();
+        if (rhs.endsWith(";")) { rhs = rhs.substring(0, rhs.length() - 1).trim(); }
+        let k = litKind(rhs);
+        names.push(nm);
+        kinds.push(vfield(k, 0));
+        scales.push(parseInt(vfield(k, 1)));
+        widths.push(parseInt(vfield(k, 2)));
+        if (vfield(k, 0) == "?") { inits.push(""); } else { inits.push(rhs); }
+    }
+
+    // counters declared inside a `for (let k = …;` header are WORKING-STORAGE
+    // items too — COBOL has no scope narrower than the program.
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (!t.startsWith("for (let ")) { continue; }
+        let rest = t.substring(9);
+        let eq = rest.indexOf(" = ");
+        if (eq < 0) { continue; }
+        let nm = rest.substring(0, eq).trim();
+        if (nm == "" || nm.includes(" ")) { continue; }
+        let already = false;
+        for (let e in names) { if (e == nm) { already = true; } }
+        if (already) { continue; }
+        let vfrom = rest.substring(eq + 3).trim();
+        let semi = vfrom.indexOf(";");
+        if (semi >= 0) { vfrom = vfrom.substring(0, semi).trim(); }
+        let k2 = litKind(vfrom);
+        let kk = vfield(k2, 0);
+        if (kk == "?") { kk = "int"; }
+        names.push(nm);
+        kinds.push(kk);
+        scales.push(parseInt(vfield(k2, 1)));
+        widths.push(parseInt(vfield(k2, 2)));
+        inits.push("");
+    }
+
+    // widen from every assignment `NAME = <literal>;` anywhere in the file
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("//")) { continue; }
+        if (t.startsWith("let ")) { t = t.substring(4).trim(); }
+        let eq = t.indexOf(" = ");
+        if (eq < 0 || !t.endsWith(";")) { continue; }
+        let nm = t.substring(0, eq).trim();
+        let k = litKind(t.substring(eq + 3));
+        if (vfield(k, 0) == "?") { continue; }
+        let i = 0;
+        while (i < names.length()) {
+            if (names[i] == nm) {
+                let nk = vfield(k, 0);
+                let ns = parseInt(vfield(k, 1));
+                let nw = parseInt(vfield(k, 2));
+                // a string literal anywhere makes the item alphanumeric;
+                // otherwise the widest/most precise literal wins
+                if (nk == "str" || kinds[i] == "?") { kinds[i] = nk; }
+                if (nk == "dec" && kinds[i] == "int") { kinds[i] = "dec"; }
+                if (ns > scales[i]) { scales[i] = ns; }
+                if (nw > widths[i]) { widths[i] = nw; }
+            }
+            i = i + 1;
+        }
+    }
+    let res = [];
+    let i = 0;
+    while (i < names.length()) {
+        let k = kinds[i];
+        if (k == "?") { k = "int"; }
+        res.push(names[i] + "|" + k + "|" + scales[i] + "|" + widths[i] + "|" + inits[i]);
+        i = i + 1;
+    }
+    return res;
+}
+
+// PIC for an inferred entry. Numerics are signed and padded to 9 integer digits
+// so intermediate results fit; `V` keeps the decimal point implied (a literal
+// '.' in a PIC would read back as numeric-edited).
+fn string picOf(string entry) {
+    let kind = vfield(entry, 1);
+    let scale = parseInt(vfield(entry, 2));
+    let width = parseInt(vfield(entry, 3));
+    if (kind == "str") {
+        let w = width;
+        if (w < 1) { w = 1; }
+        return "PIC X(" + w + ")";
+    }
+    if (kind == "dec") {
+        let ip = width;
+        if (ip < 9) { ip = 9; }
+        let frac = "";
+        let k = 0;
+        while (k < scale) { frac = frac + "9"; k = k + 1; }
+        return "PIC S9(" + ip + ")V" + frac;
+    }
+    return "PIC S9(9)";
+}
+
+fn string valueOf(string entry) {
+    let kind = vfield(entry, 1);
+    let init = vfield(entry, 4);
+    if (init == "") {
+        if (kind == "str") { return " VALUE SPACES"; }
+        return " VALUE 0";
+    }
+    let v = init;
+    if (v.endsWith("m")) { v = v.substring(0, v.length() - 1); }
+    return " VALUE " + v;
+}
+
+// COBOL words we must not hand back as a PROGRAM-ID (the file name drives it).
+fn bool isReservedWord(string w) {
+    let words = ["INDEX", "DATA", "PROGRAM", "FILE", "REPORT", "TABLE", "SORT",
+                 "MERGE", "COUNT", "LENGTH", "STATUS", "KEY", "MODE", "SIZE",
+                 "TYPE", "VALUE", "TEST", "EXIT", "STOP", "MOVE", "ADD", "SUM",
+                 "SET", "SEARCH", "START", "READ", "WRITE", "OPEN", "CLOSE",
+                 "CALL", "DISPLAY", "ACCEPT", "DIVIDE", "MULTIPLY", "SUBTRACT",
+                 "COMPUTE", "STRING", "UNSTRING", "INSPECT", "COPY", "END"];
+    for (let x in words) { if (x == w) { return true; } }
+    return false;
+}
+
+fn string progIdFrom(string path) {
+    let norm = path.replaceAll("\\", "/");
+    let parts = norm.split("/");
+    let base = parts[parts.length() - 1];
+    if (base.toLowerCase().endsWith(".sz")) { base = base.substring(0, base.length() - 3); }
+    let nm = cobName(base).toUpperCase();
+    let clean2 = "";
+    let i = 0;
+    while (i < nm.length()) {
+        let c = nm[i];
+        if ("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-".includes(c)) { clean2 = clean2 + c; }
+        i = i + 1;
+    }
+    if (clean2 == "") { clean2 = "PROG"; }
+    if (isReservedWord(clean2)) { clean2 = clean2 + "-PROG"; }
+    return clean2;
+}
+
+// Whole DATA half inferred from the code, for a .sz that carries no //@.
+fn string inferredPre([string] lines, string path) {
+    let s = "IDENTIFICATION DIVISION.\nPROGRAM-ID. " + progIdFrom(path) + ".\n"
+          + "DATA DIVISION.\nWORKING-STORAGE SECTION.\n";
+    for (let v in inferVars(lines)) {
+        s = s + "01 " + cobName(vfield(v, 0)).toUpperCase() + " " + picOf(v) + valueOf(v) + ".\n";
+    }
+    return s;
+}
+
+// ── //@ reconciliation ────────────────────────────────────────────────────────
+// Annotations are comments: nothing stops them from drifting out of step with
+// the code they describe. Rather than trusting them blindly (which would emit a
+// DATA DIVISION that contradicts the PROCEDURE), cross them against the actual
+// `let` declarations: keep what still matches, add what is missing, drop what no
+// longer exists — and say so. Returns [report, rebuiltAnnotationBlock].
+fn int annLevel(string a) {
+    let sp = a.indexOf(" ");
+    if (sp <= 0) { return -1; }
+    let lv = a.substring(0, sp);
+    if (!isDigits(lv)) { return -1; }
+    return parseInt(lv);
+}
+fn string annName(string a) {
+    let rest = a.substring(a.indexOf(" ") + 1).trim();
+    let sp = rest.indexOf(" ");
+    if (sp < 0) { sp = rest.length(); }
+    let nm = rest.substring(0, sp);
+    if (nm.endsWith(".")) { nm = nm.substring(0, nm.length() - 1); }
+    return nm;
+}
+
+fn [string] mergeAnnotations([string] lines, string path) {
+    let anns = [];
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("//@")) { anns.push(t.substring(3).trim()); }
+    }
+    if (anns.length() == 0) { return ["", inferredPre(lines, path)]; }
+
+    let vars = inferVars(lines);
+    let codeNames = [];
+    for (let v in vars) { codeNames.push(cobName(vfield(v, 0)).toUpperCase()); }
+
+    let report = "";
+    let kept = [];
+    let covered = [];
+    let inWS = false;
+    let i = 0;
+    while (i < anns.length()) {
+        let a = anns[i];
+        let au = a.toUpperCase();
+        if (au.startsWith("WORKING-STORAGE")) { inWS = true; kept.push(a); i = i + 1; continue; }
+        if (au.startsWith("FILE SECTION") || au.startsWith("LINKAGE") || au.startsWith("PROCEDURE")) {
+            inWS = false; kept.push(a); i = i + 1; continue;
+        }
+        let lv = annLevel(a);
+        // only elementary 01/77 items in WORKING-STORAGE are reconciled; group
+        // items (a level below follows), 88s, FD/SELECT and headers stay put
+        let isElem = inWS && (lv == 1 || lv == 77);
+        if (isElem && i + 1 < anns.length()) {
+            let nxt = annLevel(anns[i + 1]);
+            if (nxt > lv && nxt != 88) { isElem = false; }
+        }
+        if (!isElem) { kept.push(a); i = i + 1; continue; }
+
+        let nm = annName(a).toUpperCase();
+        let found = false;
+        for (let c in codeNames) { if (c == nm) { found = true; } }
+        if (found) {
+            kept.push(a);
+            covered.push(nm);
+        } else {
+            report = report + "  dropped: '" + nm + "' is annotated but no longer declared in the code\n";
+        }
+        i = i + 1;
+    }
+
+    // globals the annotations never mention → append inferred entries
+    let added = "";
+    let k = 0;
+    while (k < vars.length()) {
+        let cn = codeNames[k];
+        let seen = false;
+        for (let c in covered) { if (c == cn) { seen = true; } }
+        if (!seen) {
+            // it may still be referenced by a group/88 annotation; only add when
+            // no annotation mentions the name at all
+            for (let a in anns) { if (a.toUpperCase().includes(cn)) { seen = true; } }
+        }
+        if (!seen) {
+            added = added + "01 " + cn + " " + picOf(vars[k]) + valueOf(vars[k]) + ".\n";
+            report = report + "  added:   '" + cn + "' is declared in the code but was not annotated (PIC inferred)\n";
+        }
+        k = k + 1;
+    }
+
+    if (report.includes("dropped:") && report.includes("added:")) {
+        report = report + "  note:    a dropped + added pair is what a rename looks like from here;\n"
+               + "           if it was one, the original PIC could not be carried over.\n";
+    }
+
+    let blk = "";
+    for (let a in kept) { blk = blk + a + "\n"; }
+    // new items go at the end of WORKING-STORAGE, before any later section
+    if (added != "") { blk = blk + added; }
+    return [report, blk];
+}
+
+// Report the drift and, with `sync`, write the reconciled block back into the
+// source .sz. Without `sync` the source file is never touched.
+fn int applySync(string path, [string] lines, bool doSync, string report, string blk) {
+    if (report != "") {
+        let r = report;
+        while (r.endsWith("\n")) { r = r.substring(0, r.length() - 1); }
+        out "annotation drift in " + path + ":";
+        out r;
+        if (!doSync) { out "  (pass `sync` to reconcile them in the source .sz)"; }
+    }
+    if (!doSync) { return 0; }
+    let hadAnn = false;
+    for (let raw in lines) { if (raw.replaceAll("\r", "").trim().startsWith("//@")) { hadAnn = true; } }
+    let annTxt = "";
+    for (let b in blk.split("\n")) { if (b.trim() != "") { annTxt = annTxt + "//@ " + b + "\n"; } }
+    let txt = "";
+    if (hadAnn) {
+        let done = false;
+        for (let raw in lines) {
+            let t = raw.replaceAll("\r", "");
+            if (t.trim().startsWith("//@")) {
+                if (!done) { txt = txt + annTxt; done = true; }
+                continue;
+            }
+            txt = txt + t + "\n";
+        }
+    } else {
+        txt = annTxt + "\n";
+        for (let raw in lines) { txt = txt + raw.replaceAll("\r", "") + "\n"; }
+    }
+    while (txt.endsWith("\n\n")) { txt = txt.substring(0, txt.length() - 1); }
+    File.write(path, txt);
+    out "synced annotations in " + path;
+    return 0;
+}
+
+// ── plain mode: .sz written by hand ───────────────────────────────────────────
+// The paragraph path above only understands what cobol.sz emits (`fn NAME_()`
+// under a program-counter driver). A file that has no such paragraphs is treated
+// as ordinary Serez: top-level statements become the main PROCEDURE DIVISION and
+// every `fn name(params)` becomes a COBOL subprogram called with CALL … USING —
+// the same shape cobol.sz already knows how to read back.
+
+// Uppercase identifiers in emitted COBOL, leaving string literals alone.
+fn string upIdents(string s) {
+    let res = "";
+    let i = 0;
+    let inStr = false;
+    while (i < s.length()) {
+        let c = s[i];
+        if (inStr) { res = res + c; if (c == "\"") { inStr = false; } }
+        else if (c == "\"") { inStr = true; res = res + c; }
+        else { res = res + c.toUpperCase(); }
+        i = i + 1;
+    }
+    return res;
+}
+
+// Replace whole identifiers (never inside string literals): a → LK-A.
+fn string mapIdents(string s, [string] from, [string] to) {
+    let res = "";
+    let i = 0;
+    let n = s.length();
+    let inStr = false;
+    let idc = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
+    while (i < n) {
+        let c = s[i];
+        if (inStr) { res = res + c; if (c == "\"") { inStr = false; } i = i + 1; continue; }
+        if (c == "\"") { inStr = true; res = res + c; i = i + 1; continue; }
+        if (idc.includes(c)) {
+            let w = "";
+            while (i < n && idc.includes(s[i])) { w = w + s[i]; i = i + 1; }
+            let hit = "";
+            let k = 0;
+            while (k < from.length()) { if (from[k] == w) { hit = to[k]; } k = k + 1; }
+            if (hit != "") { res = res + hit; } else { res = res + w; }
+            continue;
+        }
+        res = res + c;
+        i = i + 1;
+    }
+    return res;
+}
+
+// "NAME|p1,p2|startLine|endLine" for every top-level `fn` that is NOT a
+// cobol.sz paragraph (`NAME_()`), i.e. a real function written by hand.
+fn [string] collectFns([string] lines) {
+    let res = [];
+    let depth = 0;
+    let i = 0;
+    let nL = lines.length();
+    while (i < nL) {
+        let raw = lines[i].replaceAll("\r", "");
+        let t = raw.trim();
+        if (depth == 0 && t.startsWith("fn ") && t.includes("(") && t.includes(")")) {
+            let op = t.indexOf("(");
+            let head = t.substring(3, op).trim();          // "int Sumar" / "Sumar"
+            let hp = head.split(" ");
+            let nm = hp[hp.length() - 1].trim();
+            let params = t.substring(op + 1, idxFrom(t, ")", op)).trim().replaceAll(" ", "");
+            let d = braceDelta(raw);
+            let j = i + 1;
+            while (j < nL && d > 0) { d = d + braceDelta(lines[j].replaceAll("\r", "")); j = j + 1; }
+            res.push(nm + "|" + params + "|" + i + "|" + (j - 1));
+            i = j;
+            depth = 0;
+            continue;
+        }
+        depth = depth + braceDelta(raw);
+        i = i + 1;
+    }
+    return res;
+}
+
+fn string fnField(string e, int i) { return e.split("|")[i]; }
+
+fn bool isKnownFn([string] fns, string nm) {
+    for (let f in fns) { if (fnField(f, 0) == nm) { return true; } }
+    return false;
+}
+fn bool mentionsFn(string s, [string] fns) {
+    for (let f in fns) { if (s.includes(fnField(f, 0) + "(")) { return true; } }
+    return false;
+}
+fn string fnParams([string] fns, string nm) {
+    for (let f in fns) { if (fnField(f, 0) == nm) { return fnField(f, 1); } }
+    return "";
+}
+
+// staging item in the caller: SUMAR-A / SUMAR-RESULT
+fn string stageName(string fname, string p) { return cobName(fname).toUpperCase() + "-" + cobName(p).toUpperCase(); }
+fn string linkName(string p) { return "LK-" + cobName(p).toUpperCase(); }
+
+// Split a call `f(a, b)` → name in [0], args after it. Empty when not a call.
+fn [string] callParts(string rhs, [string] fns) {
+    let s = rhs.trim();
+    if (s.endsWith(";")) { s = s.substring(0, s.length() - 1).trim(); }
+    let op = s.indexOf("(");
+    if (op <= 0 || !s.endsWith(")")) { return []; }
+    let nm = s.substring(0, op).trim();
+    if (!isKnownFn(fns, nm)) { return []; }
+    let res = [nm];
+    for (let a in splitTop(s.substring(op + 1, s.length() - 1), ",")) { res.push(a.trim()); }
+    return res;
+}
+
+// CALL … USING for `receiver = f(args);` (receiver "" → result discarded)
+fn string emitCall([string] parts, string receiver, string ind, string dot, [string] fns) {
+    let fname = parts[0];
+    let names = [];
+    let i = 1;
+    while (i < parts.length()) { names.push(parts[i]); i = i + 1; }
+    let ps = [];
+    for (let p in fnParams(fns, fname).split(",")) { if (p.trim() != "") { ps.push(p.trim()); } }
+    let body = "";
+    let k = 0;
+    let usingList = "";
+    while (k < ps.length()) {
+        let stg = stageName(fname, ps[k]);
+        let arg = "0";
+        if (k < names.length()) { arg = revArith(szSpaceOps(names[k])); }
+        body = body + ind + "MOVE " + arg + " TO " + stg + "\n";
+        usingList = usingList + " " + stg;
+        k = k + 1;
+    }
+    let resName = stageName(fname, "RESULT");
+    body = body + ind + "CALL \"" + cobName(fname).toUpperCase() + "\" USING" + usingList + " " + resName;
+    if (receiver == "") { body = body + dot + "\n"; }
+    else {
+        body = body + "\n" + ind + "MOVE " + resName + " TO " + revArith(receiver) + dot + "\n";
+    }
+    return body;
+}
+
+// Hand-written Serez may pack operators tight (`a+b`); COBOL requires them
+// surrounded by blanks. Normalising here (on the .sz side, where identifiers
+// still use `_` and never `-`) also lets isArithExpr's " + " tests work.
+fn string szSpaceOps(string s) {
+    let res = "";
+    let i = 0;
+    let n = s.length();
+    let inStr = false;
+    while (i < n) {
+        let c = s[i];
+        if (inStr) { res = res + c; if (c == "\"") { inStr = false; } i = i + 1; continue; }
+        if (c == "\"") { inStr = true; res = res + c; i = i + 1; continue; }
+        if (c == "*" && i + 1 < n && s[i + 1] == "*") { res = res + " ** "; i = i + 2; continue; }
+        if ("+-*/".includes(c)) { res = res + " " + c + " "; i = i + 1; continue; }
+        res = res + c;
+        i = i + 1;
+    }
+    while (res.includes("  ")) { res = res.replaceAll("  ", " "); }
+    return res.trim();
+}
+
+fn [string] sliceLines([string] lines, int from, int to) {
+    let sub = [];
+    let k = from;
+    while (k <= to && k < lines.length()) { sub.push(lines[k]); k = k + 1; }
+    return sub;
+}
+
+// PIC for a parameter / result slot: numeric unless a string literal is ever
+// passed in that position (or returned, for the result).
+fn string slotPic([string] lines, string fname, int slot, [string] gvars) {
+    let width = 0;
+    let isStr = false;
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        let k = "?|0|0";
+        if (slot < 0) {
+            if (!t.startsWith("return ")) { continue; }
+            k = litKind(t.substring(7));
+        } else {
+            let op = t.indexOf(fname + "(");
+            if (op < 0) { continue; }
+            let args = splitTop(t.substring(op + fname.length() + 1), ",");
+            if (slot >= args.length()) { continue; }
+            let a = args[slot].trim();
+            while (a.endsWith(")") || a.endsWith(";")) { a = a.substring(0, a.length() - 1).trim(); }
+            k = litKind(a);
+            // not a literal: the argument is a variable — take its inferred shape
+            if (vfield(k, 0) == "?") {
+                for (let v in gvars) {
+                    if (vfield(v, 0) == a.trim()) { k = vfield(v, 1) + "|" + vfield(v, 2) + "|" + vfield(v, 3); }
+                }
+            }
+        }
+        if (vfield(k, 0) == "str") {
+            isStr = true;
+            if (parseInt(vfield(k, 2)) > width) { width = parseInt(vfield(k, 2)); }
+        }
+    }
+    if (isStr) {
+        if (width < 1) { width = 1; }
+        return "PIC X(" + width + ")";
+    }
+    return "PIC S9(9)";
+}
+
+fn string initFor(string pic) {
+    if (pic.includes("X(")) { return " VALUE SPACES"; }
+    return " VALUE 0";
+}
+
+fn int picWidth(string pic) {
+    let op = pic.indexOf("(");
+    if (op < 0) { return 0; }
+    let cl = idxFrom(pic, ")", op);
+    let n = pic.substring(op + 1, cl);
+    if (!isDigits(n)) { return 0; }
+    return parseInt(n);
+}
+
+// PIC of a function's result. A numeric result is S9(9); a string result must be
+// exactly as wide as what it returns, or COBOL would pad it with blanks that the
+// .sz original never prints — so the width is the sum of the concatenated parts.
+fn string retPic([string] bodyLines, [string] pnames, [string] ppics, [string] gvars) {
+    let expr = "";
+    for (let raw in bodyLines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("return ") && t.endsWith(";") && expr == "") {
+            expr = t.substring(7, t.length() - 1).trim();
+        }
+    }
+    if (expr == "") { return "PIC S9(9)"; }
+    let parts = splitPlus(expr);
+    let hasStr = false;
+    for (let p in parts) { if (p.trim().startsWith("\"")) { hasStr = true; } }
+    if (!hasStr) { return "PIC S9(9)"; }
+    let total = 0;
+    for (let p in parts) {
+        let s = p.trim();
+        if (s.startsWith("\"") && s.endsWith("\"") && s.length() >= 2) { total = total + s.length() - 2; continue; }
+        let w = 0;
+        let i = 0;
+        while (i < pnames.length()) { if (pnames[i] == s) { w = picWidth(ppics[i]); } i = i + 1; }
+        if (w == 0) {
+            for (let v in gvars) { if (vfield(v, 0) == s) { w = picWidth(picOf(v)); } }
+        }
+        if (w == 0) { w = 20; }
+        total = total + w;
+    }
+    if (total < 1) { total = 1; }
+    return "PIC X(" + total + ")";
+}
+
+// Concatenation that involves a string literal is COBOL's STRING verb, not
+// arithmetic — checked before isArithExpr, which would see the '+' and COMPUTE.
+fn string strConcat(string expr, string target, string ind, string dot) {
+    let parts = splitPlus(expr);
+    if (parts.length() < 2) { return ""; }
+    let hasStr = false;
+    for (let p in parts) { if (p.trim().startsWith("\"")) { hasStr = true; } }
+    if (!hasStr) { return ""; }
+    let s = "STRING ";
+    for (let p in parts) { s = s + revArith(p) + " DELIMITED BY SIZE "; }
+    return ind + s + "INTO " + target + dot + "\n";
+}
+
+// Translate a run of plain statements into a COBOL PROCEDURE body.
+// retTarget = "" in the main program (a `return` there ends the run).
+fn string plainBody([string] lines, int from, int to, [string] fns, string retTarget, string ind) {
+    let body = "";
+    let closes = [];
+    let i = from;
+    while (i <= to && i < lines.length()) {
+        let t = lines[i].replaceAll("\r", "").trim();
+        i = i + 1;
+        if (t == "" || t.startsWith("//") || t.startsWith("use ")) { continue; }
+
+        if (t == r"}") {
+            if (closes.length() == 0) { continue; }
+            let m = closes.pop();
+            let d0 = "";
+            if (closes.length() == 0) { d0 = "."; }
+            if (m == "PERF") { body = body + ind + "END-PERFORM" + d0 + "\n"; }
+            else {
+                let cnt = parseInt(m.substring(3));
+                let k = 0;
+                while (k < cnt) {
+                    let d2 = "";
+                    if (k == cnt - 1) { d2 = d0; }
+                    body = body + ind + "END-IF" + d2 + "\n";
+                    k = k + 1;
+                }
+            }
+            continue;
+        }
+        if (t == r"} else {") { body = body + ind + "ELSE\n"; continue; }
+        if (t.startsWith(r"} else if (") && t.endsWith(r") {")) {
+            let cond = szSpaceOps(t.substring(11, t.length() - 3));
+            let top = closes.length() - 1;
+            if (top >= 0) { closes[top] = "IF:" + (parseInt(closes[top].substring(3)) + 1); }
+            body = body + ind + "ELSE\n" + ind + "IF " + revCond(cond) + "\n";
+            continue;
+        }
+        if (t.startsWith("if (") && t.endsWith(r") {")) {
+            body = body + ind + "IF " + revCond(szSpaceOps(t.substring(4, t.length() - 3))) + "\n";
+            closes.push("IF:1");
+            continue;
+        }
+        if (t.startsWith("while (") && t.endsWith(r") {")) {
+            body = body + ind + "PERFORM UNTIL NOT (" + revCond(szSpaceOps(t.substring(7, t.length() - 3))) + ")\n";
+            closes.push("PERF");
+            continue;
+        }
+        if (t.startsWith("for (let ") && t.endsWith(r") {") && t.includes(";")) {
+            let inner = t.substring(5, t.length() - 3);
+            let ps = inner.split(";");
+            if (ps.length() >= 3) {
+                let init = ps[0].trim();
+                let vnm = init.substring(4, init.indexOf(" = ")).trim();
+                let vfrom = init.substring(init.indexOf(" = ") + 3).trim();
+                let by = "1";
+                let stepSp = szSpaceOps(ps[2]);
+                let pl = stepSp.indexOf(" + ");
+                if (pl >= 0) { by = stepSp.substring(pl + 3).trim(); }
+                body = body + ind + "PERFORM VARYING " + revArith(vnm) + " FROM " + revArith(szSpaceOps(vfrom))
+                     + " BY " + revArith(by) + " UNTIL NOT (" + revCond(szSpaceOps(ps[1])) + ")\n";
+                closes.push("PERF");
+                continue;
+            }
+        }
+
+        let dot = "";
+        if (closes.length() == 0) { dot = "."; }
+
+        if (t.startsWith("out ")) {
+            let oe = t.substring(4, t.length() - 1).trim();
+            // `out f(x);` — run the CALL first, then DISPLAY what it left behind
+            let cpO = callParts(oe, fns);
+            if (cpO.length() > 0) {
+                body = body + emitCall(cpO, "", ind, "", fns);
+                body = body + ind + "DISPLAY " + stageName(cpO[0], "RESULT") + dot + "\n";
+                continue;
+            }
+            body = body + ind + "DISPLAY " + revDisplay(szSpaceOps(oe)) + dot + "\n";
+            continue;
+        }
+        if (t == "exit(0);") { body = body + ind + "STOP RUN" + dot + "\n"; continue; }
+        if (t == "return;") {
+            if (retTarget == "") { body = body + ind + "STOP RUN" + dot + "\n"; }
+            else { body = body + ind + "GOBACK" + dot + "\n"; }
+            continue;
+        }
+        if (t.startsWith("return ")) {
+            let e = szSpaceOps(t.substring(7, t.length() - 1));
+            if (retTarget == "") { body = body + ind + "STOP RUN" + dot + "\n"; }
+            else {
+                let d1 = "";
+                let cp0 = callParts(e, fns);
+                let cat0 = strConcat(e, retTarget, ind, "");
+                if (cp0.length() > 0) { body = body + emitCall(cp0, retTarget, ind, "", fns); }
+                else if (cat0 != "") { body = body + cat0; }
+                else if (isArithExpr(stripWrappers(unwrap(e)))) {
+                    body = body + ind + "COMPUTE " + retTarget + " = " + revArith(e) + "\n";
+                } else {
+                    body = body + ind + "MOVE " + revArith(e) + " TO " + retTarget + "\n";
+                }
+                body = body + ind + "GOBACK" + dot + d1 + "\n";
+            }
+            continue;
+        }
+
+        // bare call statement:  f(a, b);
+        let cpS = callParts(t, fns);
+        if (cpS.length() > 0) { body = body + emitCall(cpS, "", ind, dot, fns); continue; }
+
+        // assignment / declaration
+        let src = t;
+        let isDecl = false;
+        if (src.startsWith("let ")) { src = src.substring(4).trim(); isDecl = true; }
+        let eq = src.indexOf(" = ");
+        if (eq > 0 && src.endsWith(";")) {
+            let lhs = src.substring(0, eq).trim();
+            let rhs0 = src.substring(eq + 3, src.length() - 1).trim();
+            let cp = callParts(rhs0, fns);
+            if (cp.length() > 0) { body = body + emitCall(cp, lhs, ind, dot, fns); continue; }
+            // a declaration with a literal is already a VALUE clause in the DATA
+            // DIVISION — no statement needed.
+            if (isDecl && vfield(litKind(rhs0), 0) != "?") { continue; }
+            let rhs = szSpaceOps(rhs0);
+            let cat = strConcat(rhs, revArith(lhs), ind, dot);
+            if (cat != "") { body = body + cat; continue; }
+            if (isArithExpr(stripWrappers(unwrap(rhs)))) {
+                body = body + ind + "COMPUTE " + revArith(lhs) + " = " + revArith(rhs) + dot + "\n";
+            } else {
+                body = body + ind + "MOVE " + revArith(rhs) + " TO " + revArith(lhs) + dot + "\n";
+            }
+            continue;
+        }
+    }
+    return body;
+}
+
+// Everything the plain path cannot express in COBOL. Reported with a line
+// number; nothing is written when this comes back non-empty.
+fn [string] plainErrors([string] lines, [string] fns) {
+    let errs = [];
+    let i = 0;
+    let nL = lines.length();
+    let skipTo = -1;
+    while (i < nL) {
+        let ln = i + 1;
+        let t = lines[i].replaceAll("\r", "").trim();
+        i = i + 1;
+        if (t == "" || t.startsWith("//") || t.startsWith("use ")) { continue; }
+        if (t.includes("=>")) { errs.push(ln + ": lambdas / arrow functions have no COBOL equivalent"); continue; }
+        if (t.includes(".push(") || t.includes(".pop(")) { errs.push(ln + ": dynamic arrays (push/pop) have no COBOL equivalent — a COBOL table has a fixed OCCURS"); continue; }
+        if (t.includes(r"({")) { errs.push(ln + ": dictionaries have no COBOL equivalent"); continue; }
+        if (t.startsWith("import ")) { errs.push(ln + ": imports are not translated — COBOL has no module system (use CALL to a same-file subprogram)"); continue; }
+        if (t.startsWith("class ") || t.startsWith("interface ") || t.startsWith("enum ")) { errs.push(ln + ": classes / interfaces / enums have no COBOL equivalent"); continue; }
+        if (t.startsWith("try") || t.startsWith("throw ") || t.startsWith("catch")) { errs.push(ln + ": exceptions have no COBOL equivalent"); continue; }
+        if (t.startsWith("for ") && t.includes(" in ")) { errs.push(ln + ": for..in iterates a collection — COBOL needs a counted PERFORM VARYING"); continue; }
+
+        // shapes the translator does handle
+        if (t.startsWith("fn ")) { continue; }
+
+        // A call maps to CALL … USING, which is a statement, not an operand — so
+        // it only translates when it IS the whole expression, never nested in one.
+        if (mentionsFn(t, fns)) {
+            let ok = false;
+            if (callParts(t, fns).length() > 0) { ok = true; }
+            if (t.endsWith(";")) {
+                if (t.startsWith("out ")) {
+                    if (callParts(t.substring(4, t.length() - 1), fns).length() > 0) { ok = true; }
+                }
+                if (t.startsWith("return ")) {
+                    if (callParts(t.substring(7, t.length() - 1), fns).length() > 0) { ok = true; }
+                }
+                let s2 = t;
+                if (s2.startsWith("let ")) { s2 = s2.substring(4).trim(); }
+                let e2 = s2.indexOf(" = ");
+                if (e2 > 0) {
+                    if (callParts(s2.substring(e2 + 3, s2.length() - 1), fns).length() > 0) { ok = true; }
+                }
+            }
+            if (!ok) {
+                errs.push(ln + ": a call inside a larger expression is not translated — assign it to a variable first");
+                continue;
+            }
+        }
+        if (t == r"}") { continue; }
+        if (t == r"} else {") { continue; }
+        if (t.startsWith(r"} else if (") && t.endsWith(r") {")) { continue; }
+        if (t.startsWith("if (") && t.endsWith(r") {")) { continue; }
+        if (t.startsWith("while (") && t.endsWith(r") {")) { continue; }
+        if (t.startsWith("for (let ") && t.endsWith(r") {")) { continue; }
+        if (t.startsWith("out ") && t.endsWith(";")) { continue; }
+        if (t == "exit(0);" || t == "return;") { continue; }
+        if (t.startsWith("return ") && t.endsWith(";")) { continue; }
+        if (callParts(t, fns).length() > 0) { continue; }
+        let src = t;
+        if (src.startsWith("let ")) { src = src.substring(4).trim(); }
+        let eq = src.indexOf(" = ");
+        if (eq > 0 && src.endsWith(";")) {
+            let lhs = src.substring(0, eq).trim();
+            if (lhs.includes("[")) { errs.push(ln + ": indexed assignment needs a COBOL table (OCCURS) — not inferred"); continue; }
+            if (lhs.includes(".")) { errs.push(ln + ": field assignment on an object has no COBOL equivalent"); continue; }
+            let rhs = src.substring(eq + 3, src.length() - 1).trim();
+            if (rhs.startsWith("[")) { errs.push(ln + ": array literals have no COBOL equivalent"); continue; }
+            let op = rhs.indexOf("(");
+            if (op > 0 && rhs.endsWith(")")) {
+                let nm = rhs.substring(0, op).trim();
+                if (!isKnownFn(fns, nm) && !nm.includes(" ") && !nm.includes("+") && !nm.includes("-")) {
+                    errs.push(ln + ": call to '" + nm + "' — only functions defined in this same file translate (COBOL CALL)");
+                    continue;
+                }
+            }
+            continue;
+        }
+        errs.push(ln + ": cannot translate this statement to COBOL: " + t);
+    }
+    return errs;
+}
+
 // ── driver ─────────────────────────────────────────────────────────────────────
 let file = "";
+let sync = false;
 let past = false;
 for (let a in Env.args()) {
-    if (past) { if (file == "") { file = a; } }
-    else if (a.toLowerCase().endsWith("serez.sz")) { past = true; }
+    let low = a.toLowerCase();
+    // No leading dashes: `sz` rejects unknown --flags before the script runs.
+    if (low == "sync" || low == "sync=true") { sync = true; }
+    else if (past) { if (file == "") { file = a; } }
+    else if (low.endsWith("serez.sz")) { past = true; }
 }
 if (file == "") {
-    out "usage: sz serez.sz <program.sz>";
+    out "usage: sz serez.sz <program.sz> [sync]";
+    out "  sync   reconcile the //@ annotations in the source .sz with the code";
+    out "         (without it, drift is only reported)";
 } else {
     let src = File.read(file);
     let lines = src.split("\n");
@@ -278,6 +1129,126 @@ if (file == "") {
                 lastFd = "";
             }
         }
+    }
+
+    // 1.5 no cobol.sz paragraphs (`fn NAME_()`) → this is ordinary Serez, not the
+    //     output of the forward pass. Translate it as a plain program.
+    let hasParas = false;
+    for (let raw in lines) {
+        let t = raw.replaceAll("\r", "").trim();
+        if (t.startsWith("fn ") && t.includes("_()")) { hasParas = true; }
+    }
+    if (!hasParas) {
+        let fns = collectFns(lines);
+        let errs = plainErrors(lines, fns);
+        if (errs.length() > 0) {
+            out "ERROR: cannot translate " + file + " to COBOL — nothing was written.";
+            for (let e in errs) { out "  line " + e; }
+            out "";
+            out "Only a subset of Serez maps onto COBOL; see the README for what translates.";
+            exit(1);
+        }
+
+        // main program: globals + one staging item per parameter/result
+        let mainLines = [];
+        for (let raw in lines) { mainLines.push(raw); }
+        for (let f in fns) {
+            let s0 = parseInt(fnField(f, 2));
+            let e0 = parseInt(fnField(f, 3));
+            let q = s0;
+            while (q <= e0 && q < mainLines.length()) { mainLines[q] = ""; q = q + 1; }
+        }
+
+        // DATA half: annotations reconciled against the code when the file has
+        // any, fully inferred when it has none.
+        let mrg = mergeAnnotations(mainLines, file);
+        applySync(file, lines, sync, mrg[0], mrg[1]);
+        let head = mrg[1];
+        let gvars = inferVars(mainLines);
+        for (let f in fns) {
+            let fname = fnField(f, 0);
+            let pnames = [];
+            let ppics = [];
+            let slot = 0;
+            for (let p in fnField(f, 1).split(",")) {
+                if (p.trim() != "") {
+                    let pp = slotPic(lines, fname, slot, gvars);
+                    pnames.push(p.trim());
+                    ppics.push(pp);
+                    head = head + "01 " + stageName(fname, p.trim()) + " " + pp + initFor(pp) + ".\n";
+                    slot = slot + 1;
+                }
+            }
+            let rpic = retPic(sliceLines(lines, parseInt(fnField(f, 2)), parseInt(fnField(f, 3))), pnames, ppics, gvars);
+            head = head + "01 " + stageName(fname, "RESULT") + " " + rpic + initFor(rpic) + ".\n";
+        }
+
+        let mainBody = plainBody(mainLines, 0, mainLines.length() - 1, fns, "", "           ");
+        if (!mainBody.includes("STOP RUN")) { mainBody = mainBody + "           STOP RUN.\n"; }
+        let text = head + "PROCEDURE DIVISION.\n" + upIdents(mainBody);
+        if (fns.length() > 0) { text = text + "END PROGRAM " + progIdFrom(file) + ".\n"; }
+
+        // one subprogram per hand-written fn
+        for (let f in fns) {
+            let fname = fnField(f, 0);
+            let cobFn = cobName(fname).toUpperCase();
+            let s0 = parseInt(fnField(f, 2));
+            let e0 = parseInt(fnField(f, 3));
+            let bodyLines = sliceLines(lines, s0 + 1, e0 - 1);
+            let froms = [];
+            let tos = [];
+            let subPics = [];
+            let link = "";
+            let usingList = "";
+            let slot = 0;
+            for (let p in fnField(f, 1).split(",")) {
+                let pn = p.trim();
+                if (pn != "") {
+                    let pp = slotPic(lines, fname, slot, gvars);
+                    froms.push(pn);
+                    tos.push(linkName(pn));
+                    subPics.push(pp);
+                    link = link + "01 " + linkName(pn) + " " + pp + ".\n";
+                    usingList = usingList + " " + linkName(pn);
+                    slot = slot + 1;
+                }
+            }
+            let retTarget = "LK-RESULT";
+            let taken = false;
+            for (let x in tos) { if (x == retTarget) { taken = true; } }
+            if (taken) { retTarget = "LK-RESULT-0"; }
+            // must be the same PIC the caller staged, or the CALL would truncate
+            link = link + "01 " + retTarget + " " + retPic(bodyLines, froms, subPics, gvars) + ".\n";
+            usingList = usingList + " " + retTarget;
+
+            let locals = "";
+            for (let v in inferVars(bodyLines)) {
+                let vn = vfield(v, 0);
+                let isParam = false;
+                for (let x in froms) { if (x == vn) { isParam = true; } }
+                if (!isParam) {
+                    locals = locals + "01 " + cobName(vn).toUpperCase() + " " + picOf(v) + valueOf(v) + ".\n";
+                }
+            }
+
+            let sub = "\nIDENTIFICATION DIVISION.\n";
+            sub = sub + "PROGRAM-ID. " + cobFn + ".\n";
+            sub = sub + "DATA DIVISION.\n";
+            if (locals != "") { sub = sub + "WORKING-STORAGE SECTION.\n" + locals; }
+            sub = sub + "LINKAGE SECTION.\n" + link;
+            sub = sub + "PROCEDURE DIVISION USING" + usingList + ".\n";
+            let sb = plainBody(bodyLines, 0, bodyLines.length() - 1, fns, retTarget, "           ");
+            sb = mapIdents(sb, froms, tos);
+            if (!sb.includes("GOBACK")) { sb = sb + "           GOBACK.\n"; }
+            sub = sub + upIdents(sb);
+            sub = sub + "END PROGRAM " + cobFn + ".\n";
+            text = text + sub;
+        }
+
+        let outP = file.substring(0, file.length() - 3) + ".cob";
+        File.write(outP, text);
+        out "translated " + file + " -> " + outP;
+        exit(0);
     }
 
     // ALTER: map each __alt_<P> global to its original GO TO target
@@ -643,6 +1614,12 @@ if (file == "") {
         }
         // anything else: drop (driver internals)
     }
+
+    // reconcile the annotations against the code (or infer the whole DATA half
+    // when the .sz carries none, e.g. one produced with `clean`)
+    let mrg2 = mergeAnnotations(lines, file);
+    applySync(file, lines, sync, mrg2[0], mrg2[1]);
+    pre = mrg2[1];
 
     let outName = file.substring(0, file.length() - 3) + ".cob";
     File.write(outName, pre + "\n       PROCEDURE DIVISION.\n" + body);

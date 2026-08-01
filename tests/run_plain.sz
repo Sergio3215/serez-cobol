@@ -1,0 +1,118 @@
+// Plain-mode test (pure .sz): hand-written Serez → COBOL → .sz → run, and check
+// the behavior survives. These sources carry no `//@` annotations, so the DATA
+// DIVISION is inferred from the code alone.
+//
+//   sz tests/run_plain.sz            # from the repo root
+//
+// It works on a temp copy (~pl.*) and never touches examples/plain/*.sz.
+// The second half checks the opposite: sources that must be REFUSED, with a
+// non-zero exit and no .cob left behind.
+
+use permissions { OS, File, Env }
+
+let names = ["sumar", "control", "textos"];
+let rejected = ["_rejected"];
+
+fn runSz(string f) {
+    let r = null;
+    unsafe { r = OS.exec("sz", [f]); }
+    return r.stdout.replaceAll("\r", "").trim();
+}
+fn exec2(string a, string b) {
+    let r = null;
+    unsafe { r = OS.exec("sz", [a, b]); }
+    return r;
+}
+
+let pass = 0;
+let fail = 0;
+
+for (let nm in names) {
+    File.write("~pl.sz", File.read("examples/plain/" + nm + ".sz"));
+    let before = runSz("~pl.sz");
+    exec2("serez.sz", "~pl.sz");        // .sz → COBOL (inferred DATA DIVISION)
+    exec2("cobol.sz", "~pl.cob");       // COBOL → .sz
+    let after = runSz("~pl.sz");
+    if (before == after && before != "") {
+        out "[OK]     " + nm;
+        pass = pass + 1;
+    } else {
+        out "[DIFF]   " + nm;
+        out "  before: " + before;
+        out "  after:  " + after;
+        fail = fail + 1;
+    }
+}
+
+// a refusal must be loud: non-zero exit, a reason per line, and no .cob written
+for (let nm in rejected) {
+    File.write("~pl.sz", File.read("examples/plain/" + nm + ".sz"));
+    unsafe { if (File.exists("~pl.cob")) { File.delete("~pl.cob"); } }
+    let r = exec2("serez.sz", "~pl.sz");
+    let wrote = File.exists("~pl.cob");
+    if (r.code != 0 && !wrote && r.stdout.includes("no COBOL equivalent")) {
+        out "[OK]     " + nm + " (refused, nothing written)";
+        pass = pass + 1;
+    } else {
+        out "[BAD]    " + nm + " — expected a refusal";
+        out "  exit=" + r.code + " wrote .cob=" + wrote;
+        fail = fail + 1;
+    }
+}
+
+// ── flags: clean (forward) and sync (reverse) ────────────────────────────────
+
+fn exec3(string a, string b, string c) {
+    let r = null;
+    unsafe { r = OS.exec("sz", [a, b, c]); }
+    return r;
+}
+
+// `clean` drops the //@ from the generated .sz; the reverse must still produce a
+// COBOL program that behaves the same, inferring the DATA DIVISION.
+File.write("~pl.cob", File.read("examples/hello.cob"));
+exec2("cobol.sz", "~pl.cob");
+let plainOut = runSz("~pl.sz");
+File.write("~pl.cob", File.read("examples/hello.cob"));
+exec3("cobol.sz", "~pl.cob", "clean");
+let cleanSrc = File.read("~pl.sz");
+let cleanOut = runSz("~pl.sz");
+exec2("serez.sz", "~pl.sz");
+exec2("cobol.sz", "~pl.cob");
+let cleanBack = runSz("~pl.sz");
+if (!cleanSrc.includes("//@") && cleanOut == plainOut && cleanBack == plainOut) {
+    out "[OK]     clean (no //@, behavior preserved through the round-trip)";
+    pass = pass + 1;
+} else {
+    out "[BAD]    clean";
+    out "  has //@: " + cleanSrc.includes("//@") + "  out=" + cleanOut + "  back=" + cleanBack;
+    fail = fail + 1;
+}
+
+// `sync` reconciles annotations that no longer match the code. Rename a variable
+// in the code only, and the stale annotation must be replaced.
+File.write("~pl.cob", File.read("examples/hello.cob"));
+exec2("cobol.sz", "~pl.cob");
+File.write("~pl.sz", File.read("~pl.sz").replaceAll("WS_NAME", "WS_NOMBRE"));
+let before2 = File.read("~pl.sz");
+exec2("serez.sz", "~pl.sz");                 // no sync → must NOT touch the source
+let untouched = File.read("~pl.sz") == before2;
+exec3("serez.sz", "~pl.sz", "sync");         // sync → reconciles in place
+let synced = File.read("~pl.sz");
+if (untouched && !synced.includes("01 WS-NAME ") && synced.includes("WS-NOMBRE")) {
+    out "[OK]     sync (source untouched without it, reconciled with it)";
+    pass = pass + 1;
+} else {
+    out "[BAD]    sync";
+    out "  untouched without sync: " + untouched;
+    fail = fail + 1;
+}
+
+unsafe {
+    if (File.exists("~pl.sz")) { File.delete("~pl.sz"); }
+    if (File.exists("~pl.cob")) { File.delete("~pl.cob"); }
+}
+
+out "";
+out "PLAIN: " + pass + " passed  " + fail + " failed";
+if (fail > 0) { exit(1); }

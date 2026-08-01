@@ -1,0 +1,11 @@
+// Everything here is deliberately outside the COBOL subset: the translator must
+// refuse it with a per-line reason and write no .cob at all.
+
+let items = [1, 2, 3];
+items.push(4);
+let doble = x => x * 2;
+let cfg = ({"a", 1});
+
+for (let it in items) {
+    out it;
+}

@@ -11,6 +11,10 @@
 //   sz run convert path/to/program.sz
 // Or run the entry directly from the repo:
 //   sz index.sz path/to/program.cob
+//
+// Options (no leading dashes — `sz` rejects unknown --flags before this runs):
+//   clean   .cob input: leave the //@ annotations out of the generated .sz
+//   sync    .sz  input: reconcile the //@ annotations with the code, in place
 
 use permissions { OS, Env, File }
 
@@ -20,10 +24,17 @@ use permissions { OS, Env, File }
 let file = "";
 let scriptPath = "";
 let past = false;
+let clean = false;
+let sync = false;
 for (let a in Env.args()) {
-    if (past) {
+    let al = a.toLowerCase();
+    // Options carry no leading dashes: `sz` itself rejects unknown --flags
+    // before this script ever runs.
+    if (al == "clean" || al == "clean=true") { clean = true; }
+    else if (al == "sync" || al == "sync=true") { sync = true; }
+    else if (past) {
         if (file == "") { file = a; }
-    } else if (a.toLowerCase().endsWith("index.sz")) {
+    } else if (al.endsWith("index.sz")) {
         scriptPath = a;
         past = true;
     }
@@ -35,7 +46,15 @@ if (low.endsWith(".cob") || low.endsWith(".cbl")) { engine = "cobol.sz"; }
 else if (low.endsWith(".sz")) { engine = "serez.sz"; }
 
 if (file == "") {
-    out "usage: sz run convert <file.cob | file.sz>";
+    out "usage: sz run convert <file.cob | file.sz> [clean | sync]";
+    out "  clean   (.cob input)  omit the //@ annotations from the generated .sz";
+    out "  sync    (.sz input)   reconcile the //@ annotations with the code";
+} else if (engine == "cobol.sz" && sync) {
+    out "ERROR: `sync` reconciles the //@ annotations of a .sz — it does not apply";
+    out "to a COBOL input. Did you mean `clean`?";
+} else if (engine == "serez.sz" && clean) {
+    out "ERROR: `clean` controls whether the //@ annotations are written into a";
+    out "generated .sz — it does not apply to a .sz input. Did you mean `sync`?";
 } else if (engine == "") {
     out "ERROR: '" + file + "' is not a COBOL or Serez source.";
     out "Pass a .cob/.cbl (COBOL) file to translate to Serez, or a .sz file to translate to COBOL.";
@@ -54,10 +73,15 @@ if (file == "") {
     let enginePath = engine;
     if (dir != "") { enginePath = dir + "/" + engine; }
 
+    let argv = [enginePath, file];
+    if (clean) { argv.push("clean"); }
+    if (sync) { argv.push("sync"); }
+
     let r = null;
-    unsafe { r = OS.exec("sz", [enginePath, file]); }
+    unsafe { r = OS.exec("sz", argv); }
     let so = r.stdout.trim();
     let se = r.stderr.trim();
     if (so != "") { out so; }
     if (se != "") { out se; }
+    if (r.code != 0) { exit(r.code); }
 }

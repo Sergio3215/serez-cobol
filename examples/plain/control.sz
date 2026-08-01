@@ -1,0 +1,24 @@
+// Hand-written Serez: conditionals and both loop shapes.
+
+let total = 0;
+let i = 0;
+
+while (i < 5) {
+    total = total + i;
+    i = i + 1;
+}
+out "suma 0..4: " + total;
+
+if (total > 10) {
+    out "mayor a diez";
+} else if (total == 10) {
+    out "es diez";
+} else {
+    out "menor a diez";
+}
+
+let acum = 0;
+for (let k = 1; k < 4; k = k + 1) {
+    acum = acum + k * 2;
+}
+out "acumulado: " + acum;

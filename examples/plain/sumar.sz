@@ -1,0 +1,10 @@
+// Hand-written Serez — no //@ annotations anywhere.
+// A function with parameters and a return value becomes a COBOL subprogram
+// reached with CALL … USING.
+
+fn int Sumar(a, b) {
+    return a + b;
+}
+
+let resultado = Sumar(10, 20);
+out resultado;
