@@ -652,8 +652,11 @@ fn string mapIdents(string s, [string] from, [string] to) {
     return res;
 }
 
-// "NAME|p1,p2|startLine|endLine" for every top-level `fn` that is NOT a
-// cobol.sz paragraph (`NAME_()`), i.e. a real function written by hand.
+// "NAME|p1,p2|startLine|endLine|type1,type2|returnType" for every top-level `fn`
+// that is NOT a cobol.sz paragraph (`NAME_()`), i.e. a real function written by
+// hand. Parameters may be typed (`fn int Suman(int a, int b)`) — the type is a
+// separate word, never part of the name, and it beats inference for the PIC.
+// Unknown types are recorded as "?" so the CSV keeps one slot per parameter.
 fn [string] collectFns([string] lines) {
     let res = [];
     let depth = 0;
@@ -667,11 +670,25 @@ fn [string] collectFns([string] lines) {
             let head = t.substring(3, op).trim();          // "int Sumar" / "Sumar"
             let hp = head.split(" ");
             let nm = hp[hp.length() - 1].trim();
-            let params = t.substring(op + 1, idxFrom(t, ")", op)).trim().replaceAll(" ", "");
+            let retT = "?";
+            if (hp.length() > 1) { retT = hp[0].trim(); }
+            // each parameter is "name" or "type name" — the NAME is the last word
+            let pn = "";
+            let pt = "";
+            for (let p in t.substring(op + 1, idxFrom(t, ")", op)).split(",")) {
+                let q = p.trim();
+                if (q == "") { continue; }
+                let ws = q.split(" ");
+                let ty = "?";
+                if (ws.length() > 1) { ty = ws[0].trim(); }
+                if (pn != "") { pn = pn + ","; pt = pt + ","; }
+                pn = pn + ws[ws.length() - 1].trim();
+                pt = pt + ty;
+            }
             let d = braceDelta(raw);
             let j = i + 1;
             while (j < nL && d > 0) { d = d + braceDelta(lines[j].replaceAll("\r", "")); j = j + 1; }
-            res.push(nm + "|" + params + "|" + i + "|" + (j - 1));
+            res.push(nm + "|" + pn + "|" + i + "|" + (j - 1) + "|" + pt + "|" + retT);
             i = j;
             depth = 0;
             continue;
@@ -688,6 +705,21 @@ fn bool isKnownFn([string] fns, string nm) {
     for (let f in fns) { if (fnField(f, 0) == nm) { return true; } }
     return false;
 }
+// declared type of parameter `slot` ("?" when the parameter is untyped)
+fn string ptypeOf(string entry, int slot) {
+    let parts = entry.split("|");
+    if (parts.length() < 5) { return "?"; }
+    if (parts[4].trim() == "") { return "?"; }
+    let ts = parts[4].split(",");
+    if (slot < 0 || slot >= ts.length()) { return "?"; }
+    return ts[slot].trim();
+}
+fn string rettypeOf(string entry) {
+    let parts = entry.split("|");
+    if (parts.length() < 6) { return "?"; }
+    return parts[5].trim();
+}
+
 fn bool mentionsFn(string s, [string] fns) {
     for (let f in fns) { if (s.includes(fnField(f, 0) + "(")) { return true; } }
     return false;
@@ -772,7 +804,10 @@ fn [string] sliceLines([string] lines, int from, int to) {
 
 // PIC for a parameter / result slot: numeric unless a string literal is ever
 // passed in that position (or returned, for the result).
-fn string slotPic([string] lines, string fname, int slot, [string] gvars) {
+fn string slotPic([string] lines, string fname, int slot, [string] gvars, string dtype) {
+    // a declared type beats anything inferred from the call sites
+    if (dtype == "int") { return "PIC S9(9)"; }
+    if (dtype == "dec") { return "PIC S9(9)V99"; }
     let width = 0;
     let isStr = false;
     for (let raw in lines) {
@@ -801,11 +836,31 @@ fn string slotPic([string] lines, string fname, int slot, [string] gvars) {
             if (parseInt(vfield(k, 2)) > width) { width = parseInt(vfield(k, 2)); }
         }
     }
+    // declared `string` with no literal to size it from: fall back to a line
+    if (dtype == "string") {
+        isStr = true;
+        if (width < 1) { width = 20; }
+    }
     if (isStr) {
         if (width < 1) { width = 1; }
         return "PIC X(" + width + ")";
     }
     return "PIC S9(9)";
+}
+
+// Swap the PIC of an already-emitted `01 NAME …` item in the DATA half.
+fn string replaceDataItem(string head, string nm, string pic) {
+    let key = "01 " + nm + " ";
+    let at = head.indexOf(key);
+    if (at < 0) { return head; }
+    let nl = idxFrom(head, "\n", at);
+    if (nl < 0) { nl = head.length(); }
+    return head.substring(0, at) + "01 " + nm + " " + pic + initForPic(pic) + "." + head.substring(nl);
+}
+
+fn string initForPic(string pic) {
+    if (pic.includes("X(")) { return " VALUE SPACES"; }
+    return " VALUE 0";
 }
 
 fn string initFor(string pic) {
@@ -825,7 +880,57 @@ fn int picWidth(string pic) {
 // PIC of a function's result. A numeric result is S9(9); a string result must be
 // exactly as wide as what it returns, or COBOL would pad it with blanks that the
 // .sz original never prints — so the width is the sum of the concatenated parts.
-fn string retPic([string] bodyLines, [string] pnames, [string] ppics, [string] gvars) {
+fn int picScale(string pic) {
+    let v = pic.indexOf("V");
+    if (v < 0) { return 0; }
+    let c = 0;
+    let i = v + 1;
+    while (i < pic.length()) { if (pic[i] == "9") { c = c + 1; } i = i + 1; }
+    return c;
+}
+
+// Scale of a dec expression, COBOL-style: a product adds the operands' scales,
+// a sum takes the widest. Without this a `dec` result would get a fixed V99 and
+// COBOL would silently truncate what Serez computed exactly — the one thing this
+// translator exists to get right.
+fn int exprScale(string e, [string] pnames, [string] ppics) {
+    let s = unwrap(e.trim());
+    let mparts = splitTop(s, "*");
+    if (mparts.length() > 1) {
+        let tot = 0;
+        for (let p in mparts) { tot = tot + exprScale(p, pnames, ppics); }
+        return tot;
+    }
+    let pparts = splitPlus(s);
+    if (pparts.length() > 1) {
+        let mx = 0;
+        for (let p in pparts) {
+            let x = exprScale(p, pnames, ppics);
+            if (x > mx) { mx = x; }
+        }
+        return mx;
+    }
+    let a = s.trim();
+    let k = litKind(a);
+    if (vfield(k, 0) == "dec") { return parseInt(vfield(k, 1)); }
+    if (vfield(k, 0) == "int") { return 0; }
+    let i = 0;
+    while (i < pnames.length()) {
+        if (pnames[i] == a) { return picScale(ppics[i]); }
+        i = i + 1;
+    }
+    return 2;
+}
+
+fn string nines(int n) {
+    let s = "";
+    let k = 0;
+    while (k < n) { s = s + "9"; k = k + 1; }
+    return s;
+}
+
+fn string retPic([string] bodyLines, [string] pnames, [string] ppics, [string] gvars, string rtype) {
+    if (rtype == "int") { return "PIC S9(9)"; }
     let expr = "";
     for (let raw in bodyLines) {
         let t = raw.replaceAll("\r", "").trim();
@@ -833,10 +938,18 @@ fn string retPic([string] bodyLines, [string] pnames, [string] ppics, [string] g
             expr = t.substring(7, t.length() - 1).trim();
         }
     }
+    if (rtype == "dec") {
+        let sc = 2;
+        if (expr != "") { sc = exprScale(expr, pnames, ppics); }
+        if (sc < 1) { sc = 2; }
+        if (sc > 18) { sc = 18; }
+        return "PIC S9(9)V" + nines(sc);
+    }
     if (expr == "") { return "PIC S9(9)"; }
     let parts = splitPlus(expr);
     let hasStr = false;
     for (let p in parts) { if (p.trim().startsWith("\"")) { hasStr = true; } }
+    if (rtype == "string") { hasStr = true; }
     if (!hasStr) { return "PIC S9(9)"; }
     let total = 0;
     for (let p in parts) {
@@ -1164,6 +1277,8 @@ if (file == "") {
         let mrg = mergeAnnotations(mainLines, file);
         applySync(file, lines, sync, mrg[0], mrg[1]);
         let head = mrg[1];
+        let hadAnn = false;
+        for (let raw in lines) { if (raw.replaceAll("\r", "").trim().startsWith("//@")) { hadAnn = true; } }
 
         // The main PROGRAM-ID comes from the file name, so `sumar.sz` holding a
         // `fn Sumar` would emit two units called SUMAR and an ambiguous CALL.
@@ -1190,15 +1305,33 @@ if (file == "") {
             let slot = 0;
             for (let p in fnField(f, 1).split(",")) {
                 if (p.trim() != "") {
-                    let pp = slotPic(lines, fname, slot, gvars);
+                    let pp = slotPic(lines, fname, slot, gvars, ptypeOf(f, slot));
                     pnames.push(p.trim());
                     ppics.push(pp);
                     head = head + "01 " + stageName(fname, p.trim()) + " " + pp + initFor(pp) + ".\n";
                     slot = slot + 1;
                 }
             }
-            let rpic = retPic(sliceLines(lines, parseInt(fnField(f, 2)), parseInt(fnField(f, 3))), pnames, ppics, gvars);
+            let rpic = retPic(sliceLines(lines, parseInt(fnField(f, 2)), parseInt(fnField(f, 3))), pnames, ppics, gvars, rettypeOf(f));
             head = head + "01 " + stageName(fname, "RESULT") + " " + rpic + initFor(rpic) + ".\n";
+
+            // `let x = f(…)` — x is inferred from its initialiser, which is a call,
+            // so its shape is the function's result, not a number. Only when the
+            // whole DATA half was inferred: a hand-written //@ is the author's call.
+            if (!hadAnn) {
+                for (let raw in mainLines) {
+                    let t2 = raw.replaceAll("\r", "").trim();
+                    if (!t2.startsWith("let ")) { continue; }
+                    let eq2 = t2.indexOf(" = ");
+                    if (eq2 < 0) { continue; }
+                    let rhs2 = t2.substring(eq2 + 3).trim();
+                    if (rhs2.endsWith(";")) { rhs2 = rhs2.substring(0, rhs2.length() - 1).trim(); }
+                    let cp2 = callParts(rhs2, fns);
+                    if (cp2.length() == 0) { continue; }
+                    if (cp2[0] != fname) { continue; }
+                    head = replaceDataItem(head, cobName(t2.substring(4, eq2).trim()).toUpperCase(), rpic);
+                }
+            }
         }
 
         let mainBody = plainBody(mainLines, 0, mainLines.length() - 1, fns, "", "           ");
@@ -1222,7 +1355,7 @@ if (file == "") {
             for (let p in fnField(f, 1).split(",")) {
                 let pn = p.trim();
                 if (pn != "") {
-                    let pp = slotPic(lines, fname, slot, gvars);
+                    let pp = slotPic(lines, fname, slot, gvars, ptypeOf(f, slot));
                     froms.push(pn);
                     tos.push(linkName(pn));
                     subPics.push(pp);
@@ -1236,7 +1369,7 @@ if (file == "") {
             for (let x in tos) { if (x == retTarget) { taken = true; } }
             if (taken) { retTarget = "LK-RESULT-0"; }
             // must be the same PIC the caller staged, or the CALL would truncate
-            link = link + "01 " + retTarget + " " + retPic(bodyLines, froms, subPics, gvars) + ".\n";
+            link = link + "01 " + retTarget + " " + retPic(bodyLines, froms, subPics, gvars, rettypeOf(f)) + ".\n";
             usingList = usingList + " " + retTarget;
 
             let locals = "";

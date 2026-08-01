@@ -102,6 +102,23 @@ END PROGRAM DEMO.
 (`PERFORM VARYING`) · `fn` with parameters and a return value (`CALL … USING`) · `return` ·
 `exit(0)` (`STOP RUN`).
 
+### Types on parameters
+
+Parameters and return values may be typed, and the declared type drives the `PIC` directly instead
+of being guessed from the call sites:
+
+```serez
+fn int    Suman(int a, int b)     { return a + b; }        // PIC S9(9)
+fn string Saludo(string quien)    { return "hola " + quien; }
+fn dec    ConIva(dec monto)       { return monto * 1.21m; }
+```
+
+A `dec` result takes **the scale the arithmetic actually produces** — a product adds its operands'
+scales, a sum takes the widest — so `monto * 1.21m` with a `V99` argument yields `PIC S9(9)V9999`.
+A fixed `V99` there would make COBOL truncate what Serez computed exactly, which is the one thing
+this translator exists to get right. A `string` result is sized to the exact width of what it
+returns, so `DISPLAY` does not pad with blanks the `.sz` never prints.
+
 ### What does not, and says so
 
 COBOL has no dynamic arrays, dictionaries, objects, closures or dynamic typing. Anything in that

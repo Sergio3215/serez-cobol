@@ -10,7 +10,7 @@
 
 use permissions { OS, File, Env }
 
-let names = ["sumar", "control", "textos"];
+let names = ["sumar", "control", "textos", "tipado"];
 let rejected = ["_rejected"];
 
 fn runSz(string f) {

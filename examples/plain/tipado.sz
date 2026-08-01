@@ -1,0 +1,26 @@
+// Hand-written Serez with TYPED parameters and return types.
+// The type is a separate word — never part of the parameter name — and it drives
+// the PIC directly instead of being guessed from the call sites. A dec result
+// takes the scale the arithmetic actually produces (2 + 2 = 4 here), or COBOL
+// would truncate what Serez computed exactly.
+
+fn int Suman(int a, int b) {
+    return a + b;
+}
+
+fn string Saludo(string quien) {
+    return "hola " + quien;
+}
+
+fn dec ConIva(dec monto) {
+    return monto * 1.21m;
+}
+
+let total = Suman(10, 20);
+let nombre = "mundo";
+let saludo = Saludo(nombre);
+let precio = ConIva(100.00m);
+
+out total;
+out saludo;
+out precio;
