@@ -1,6 +1,6 @@
 {
   "name": "serez-cobol",
-  "version": "2.2.1",
+  "version": "2.2.2",
   "description": "COBOL -> Serez (.sz) source-to-source translator, with a reverse pass from a documented .sz subset back to COBOL. Written in pure .sz.",
   "permissions": [
     "File",
