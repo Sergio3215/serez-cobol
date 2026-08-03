@@ -297,6 +297,88 @@ fn string litKind(string rhs) {
 
 fn string vfield(string entry, int idx) { return entry.split("|")[idx]; }
 
+// Blank out the inside of string literals so a search for an operator never
+// trips on text: `out "Fee (2%)";` carries a '%' that is data, not syntax.
+fn string outsideStrings(string s) {
+    let res = "";
+    let inStr = false;
+    let i = 0;
+    while (i < s.length()) {
+        let c = s[i];
+        if (inStr) {
+            if (c == "\"") { inStr = false; res = res + c; } else { res = res + " "; }
+        } else {
+            if (c == "\"") { inStr = true; }
+            res = res + c;
+        }
+        i = i + 1;
+    }
+    return res;
+}
+
+// A value that is really a condition — COBOL has no boolean data item to hold it.
+fn bool isCondExpr(string rhs) {
+    let s = outsideStrings(rhs.trim());
+    if (s == "true" || s == "false") { return true; }
+    if (s.startsWith("!")) { return true; }
+    return s.includes("==") || s.includes("!=") || s.includes(">") || s.includes("<")
+        || s.includes("&&") || s.includes("||");
+}
+
+// Shape of an arithmetic expression over literals and items already inferred,
+// as "kind|scale" ("?|0" when an operand is unknown). COBOL rules: a product
+// adds its operands' scales, a sum / difference / quotient takes the widest.
+// Without this a computed `let t = m * 1.21m;` would land in a PIC S9(9) and
+// COBOL would print 12 where Serez prints 12.7050.
+fn string exprShape(string e, [string] names, [string] kinds, [int] scales) {
+    let s = unwrap(stripWrappers(e.trim()));
+    if (s.endsWith(";")) { s = unwrap(s.substring(0, s.length() - 1).trim()); }
+    if (s == "") { return "?|0"; }
+
+    let mparts = splitTop(s, "*");
+    if (mparts.length() > 1) {
+        let tot = 0;
+        let anyDec = false;
+        for (let p in mparts) {
+            let sh = exprShape(p, names, kinds, scales);
+            let k = vfield(sh, 0);
+            if (k == "?" || k == "str") { return "?|0"; }
+            if (k == "dec") { anyDec = true; }
+            tot = tot + parseInt(vfield(sh, 1));
+        }
+        if (anyDec) { return "dec|" + tot; }
+        return "int|0";
+    }
+
+    let parts = splitPlus(s);
+    if (parts.length() <= 1) { parts = splitTop(s, "-"); }
+    if (parts.length() <= 1) { parts = splitTop(s, "/"); }
+    if (parts.length() > 1) {
+        let mx = 0;
+        let anyDec = false;
+        for (let p in parts) {
+            let sh = exprShape(p, names, kinds, scales);
+            let k = vfield(sh, 0);
+            if (k == "?" || k == "str") { return "?|0"; }
+            if (k == "dec") { anyDec = true; }
+            let x = parseInt(vfield(sh, 1));
+            if (x > mx) { mx = x; }
+        }
+        if (anyDec) { return "dec|" + mx; }
+        return "int|0";
+    }
+
+    let a = s.trim();
+    let k2 = litKind(a);
+    if (vfield(k2, 0) != "?") { return vfield(k2, 0) + "|" + vfield(k2, 1); }
+    let i = 0;
+    while (i < names.length()) {
+        if (names[i] == a) { return kinds[i] + "|" + scales[i]; }
+        i = i + 1;
+    }
+    return "?|0";
+}
+
 // Walk the file: every top-level `let NAME = ...;` becomes a WORKING-STORAGE
 // item, then every assignment to it (at any depth) widens the inferred picture.
 fn [string] inferVars([string] lines) {
@@ -383,6 +465,37 @@ fn [string] inferVars([string] lines) {
             i = i + 1;
         }
     }
+    // computed values: `t = m * 1.21m;` is not a literal, so nothing above gave T
+    // a scale and it would land in a PIC S9(9) — COBOL printing 12 where Serez
+    // prints 12.7050. Resolve the expression against what is already inferred,
+    // repeating until nothing changes so chains of computed values settle.
+    let rounds = 0;
+    while (rounds < 5) {
+        let changed = false;
+        for (let raw in lines) {
+            let t = raw.replaceAll("\r", "").trim();
+            if (t.startsWith("//")) { continue; }
+            if (t.startsWith("let ")) { t = t.substring(4).trim(); }
+            let eq = t.indexOf(" = ");
+            if (eq < 0 || !t.endsWith(";")) { continue; }
+            let nm = t.substring(0, eq).trim();
+            let rhs = t.substring(eq + 3, t.length() - 1).trim();
+            if (vfield(litKind(rhs), 0) != "?") { continue; }
+            let sh = exprShape(rhs, names, kinds, scales);
+            if (vfield(sh, 0) != "dec") { continue; }
+            let ns = parseInt(vfield(sh, 1));
+            let i = 0;
+            while (i < names.length()) {
+                if (names[i] == nm && kinds[i] != "str") {
+                    if (kinds[i] != "dec") { kinds[i] = "dec"; changed = true; }
+                    if (ns > scales[i]) { scales[i] = ns; changed = true; }
+                }
+                i = i + 1;
+            }
+        }
+        if (changed) { rounds = rounds + 1; } else { rounds = 5; }
+    }
+
     let res = [];
     let i = 0;
     while (i < names.length()) {
@@ -1123,12 +1236,40 @@ fn [string] plainErrors([string] lines, [string] fns) {
     let errs = [];
     let i = 0;
     let nL = lines.length();
-    let skipTo = -1;
     while (i < nL) {
         let ln = i + 1;
         let t = lines[i].replaceAll("\r", "").trim();
         i = i + 1;
         if (t == "" || t.startsWith("//") || t.startsWith("use ")) { continue; }
+        // operators are only operators outside a string literal
+        let bare = outsideStrings(t);
+
+        // a match block is reported once, and its arms skipped — their `=>`
+        // would otherwise come back as "lambdas", which is not the real problem
+        if (bare.startsWith("match (") || bare.startsWith("switch (")) {
+            errs.push(ln + ": match / switch have no COBOL equivalent — use if / else if");
+            let depth = braceDelta(t);
+            while (i < nL && depth > 0) {
+                depth = depth + braceDelta(lines[i]);
+                i = i + 1;
+            }
+            continue;
+        }
+        // the translator reads one statement per line: a body squeezed onto the
+        // header line is invisible to it, so say that instead of a generic refusal
+        if ((bare.startsWith("if (") || bare.startsWith("while (") || bare.startsWith("for (")
+             || bare.startsWith(r"} else")) && bare.includes(r"{") && bare.includes(r"}")
+            && !bare.endsWith(r"{")) {
+            errs.push(ln + ": a block written on one line is not translated — put the body on its own lines");
+            continue;
+        }
+        if (bare.includes("%")) { errs.push(ln + ": the % operator has no COBOL equivalent — COBOL takes a remainder with DIVIDE … REMAINDER, which is a statement, not an operator"); continue; }
+        if (bare.includes("+=") || bare.includes("-=") || bare.includes("*=") || bare.includes("/=")) {
+            errs.push(ln + ": compound assignment is not translated — write it out, as `x = x + 1;`");
+            continue;
+        }
+        if (t == "break;" || t == "continue;") { errs.push(ln + ": break / continue have no COBOL equivalent — restructure the loop condition"); continue; }
+        if (bare == r"do {" || bare.startsWith(r"} while (")) { errs.push(ln + ": do/while has no COBOL equivalent — PERFORM UNTIL tests before the body, so use while"); continue; }
         if (t.includes("=>")) { errs.push(ln + ": lambdas / arrow functions have no COBOL equivalent"); continue; }
         if (t.includes(".push(") || t.includes(".pop(")) { errs.push(ln + ": dynamic arrays (push/pop) have no COBOL equivalent — a COBOL table has a fixed OCCURS"); continue; }
         if (t.includes(r"({")) { errs.push(ln + ": dictionaries have no COBOL equivalent"); continue; }
@@ -1183,6 +1324,7 @@ fn [string] plainErrors([string] lines, [string] fns) {
             if (lhs.includes(".")) { errs.push(ln + ": field assignment on an object has no COBOL equivalent"); continue; }
             let rhs = src.substring(eq + 3, src.length() - 1).trim();
             if (rhs.startsWith("[")) { errs.push(ln + ": array literals have no COBOL equivalent"); continue; }
+            if (isCondExpr(rhs)) { errs.push(ln + ": booleans have no COBOL equivalent — a COBOL item cannot hold true/false (use 0/1, or a level-88 condition name)"); continue; }
             let op = rhs.indexOf("(");
             if (op > 0 && rhs.endsWith(")")) {
                 let nm = rhs.substring(0, op).trim();

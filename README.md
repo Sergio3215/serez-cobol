@@ -119,11 +119,15 @@ A fixed `V99` there would make COBOL truncate what Serez computed exactly, which
 this translator exists to get right. A `string` result is sized to the exact width of what it
 returns, so `DISPLAY` does not pad with blanks the `.sz` never prints.
 
+The same rule applies to a plain variable holding a computed value — `let iva = precio * 0.21m;`
+gets `PIC S9(9)V9999`, not the `PIC S9(9)` its (non-literal) initializer would otherwise suggest.
+
 ### What does not, and says so
 
-COBOL has no dynamic arrays, dictionaries, objects, closures or dynamic typing. Anything in that
-list is **refused with the line number and the reason, and no `.cob` is written** — the translator
-never emits a half-program:
+COBOL has no dynamic arrays, dictionaries, objects, closures, exceptions, booleans or dynamic
+typing. Anything in that list is **refused with the line number and the reason, and no `.cob` is
+written** — the translator never emits a half-program, and never emits COBOL that would not
+compile:
 
 ```
 $ sz run convert app.sz
@@ -133,7 +137,28 @@ ERROR: cannot translate app.sz to COBOL — nothing was written.
   line 4: lambdas / arrow functions have no COBOL equivalent
 ```
 
-A call nested inside a larger expression is not translated either — assign it to a variable first.
+The full list of what is refused, and why:
+
+| Serez | Why COBOL cannot take it |
+| --- | --- |
+| `[1, 2, 3]`, `a.push(x)` | a COBOL table is a fixed `OCCURS`, declared up front |
+| `({ k: v })` | no dictionary / map type exists |
+| `x => x * 2` | no closures, no first-class functions |
+| `class` / `interface` / `enum` | no user-defined types |
+| `try` / `throw` / `catch` | no exceptions |
+| `import` | no module system — a `CALL` reaches a subprogram in the same file |
+| `for (x in coll)` | iteration is a counted `PERFORM VARYING` |
+| `t[i] = x` | needs a table declared with `OCCURS`, which inference cannot invent |
+| `obj.campo = x` | no object to hold the field |
+| `let ok = true;`, `let ok = a > b;` | no boolean data item — use `0`/`1`, or a level-88 name |
+| `a % 3` | remainder is a statement (`DIVIDE … REMAINDER`), not an operator |
+| `a += 2` | no compound assignment — write `a = a + 2;` |
+| `break` / `continue` | no mid-loop exit; the condition has to carry it |
+| `do { … } while (c)` | `PERFORM UNTIL` tests **before** the body |
+| `match` / `switch` | `EVALUATE` is only produced going the other way; use `if` / `else if` |
+| `s.toUpperCase()`, any stdlib call | only functions defined in the same file become a `CALL` |
+| `out "n: " + F(x);` | a `CALL` is a statement, not an operand — assign it first |
+| `if (c) { out 1; }` on one line | the translator reads one statement per line |
 
 ### What inference cannot recover
 
@@ -172,7 +197,7 @@ migrating one way and never coming back, and want a `.sz` with no annotations at
 ```sh
 sz tests/run_tests.sz         # COBOL → sz: translate + run + diff vs golden   (23)
 sz tests/run_roundtrip.sz     # COBOL → sz → COBOL → sz, behavior preserved    (22)
-sz tests/run_plain.sz         # hand-written sz → COBOL → sz, plus clean/sync   (6)
+sz tests/run_plain.sz         # hand-written sz → COBOL → sz, plus clean/sync   (9)
 ```
 
 Every `examples/<name>.cob` is translated, executed, and compared against its

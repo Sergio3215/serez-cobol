@@ -10,8 +10,24 @@
 
 use permissions { OS, File, Env }
 
-let names = ["sumar", "control", "textos", "tipado"];
+let names = ["sumar", "control", "textos", "tipado", "decimal"];
 let rejected = ["_rejected"];
+
+// Every construct in _rejected.sz must come back with its OWN reason — a single
+// generic "cannot translate this statement" tells the user nothing about which
+// part of Serez has no COBOL counterpart.
+let reasons = [
+    "array literals have no COBOL equivalent",
+    "dynamic arrays (push/pop) have no COBOL equivalent",
+    "lambdas / arrow functions have no COBOL equivalent",
+    "dictionaries have no COBOL equivalent",
+    "booleans have no COBOL equivalent",
+    "the % operator has no COBOL equivalent",
+    "compound assignment is not translated",
+    "for..in iterates a collection",
+    "break / continue have no COBOL equivalent",
+    "a block written on one line is not translated"
+];
 
 fn runSz(string f) {
     let r = null;
@@ -50,14 +66,33 @@ for (let nm in rejected) {
     unsafe { if (File.exists("~pl.cob")) { File.delete("~pl.cob"); } }
     let r = exec2("serez.sz", "~pl.sz");
     let wrote = File.exists("~pl.cob");
-    if (r.code != 0 && !wrote && r.stdout.includes("no COBOL equivalent")) {
-        out "[OK]     " + nm + " (refused, nothing written)";
+    let missing = "";
+    for (let reason in reasons) {
+        if (!r.stdout.includes(reason)) { missing = missing + "\n    " + reason; }
+    }
+    if (r.code != 0 && !wrote && missing == "") {
+        out "[OK]     " + nm + " (refused with a reason per construct, nothing written)";
         pass = pass + 1;
     } else {
         out "[BAD]    " + nm + " — expected a refusal";
         out "  exit=" + r.code + " wrote .cob=" + wrote;
+        if (missing != "") { out "  reasons never reported:" + missing; }
         fail = fail + 1;
     }
+}
+
+// A computed dec must carry its scale into the PIC. Serez computes 100.00 * 0.21
+// exactly; a PIC S9(9) receiving it would make COBOL print 21 instead of 21.0000.
+File.write("~pl.sz", File.read("examples/plain/decimal.sz"));
+exec2("serez.sz", "~pl.sz");
+let decCob = File.read("~pl.cob");
+if (decCob.includes("01 IVA PIC S9(9)V9999") && decCob.includes("01 TOTAL PIC S9(9)V9999")) {
+    out "[OK]     decimal PIC (computed scale reaches the DATA DIVISION)";
+    pass = pass + 1;
+} else {
+    out "[BAD]    decimal PIC — a computed dec lost its scale";
+    for (let l in decCob.split("\n")) { if (l.includes("01 ")) { out "  " + l.trim(); } }
+    fail = fail + 1;
 }
 
 // ── flags: clean (forward) and sync (reverse) ────────────────────────────────

@@ -1,0 +1,11 @@
+// Exact decimal arithmetic — the reason this translator exists. The scale of a
+// COMPUTED value has to reach the COBOL PIC: with `iva` declared PIC S9(9) the
+// program above would print 21 where Serez prints 21.0000.
+
+let precio = 100.00m;
+let iva = precio * 0.21m;
+let total = precio + iva;
+
+out precio;
+out iva;
+out total;

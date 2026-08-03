@@ -1,11 +1,24 @@
 // Everything here is deliberately outside the COBOL subset: the translator must
-// refuse it with a per-line reason and write no .cob at all.
+// refuse it with a per-line reason and write no .cob at all. Every construct in
+// this file is one a regular Serez program uses without thinking twice, which is
+// exactly why each one has to come back with its own reason.
 
 let items = [1, 2, 3];
 items.push(4);
 let doble = x => x * 2;
 let cfg = ({"a", 1});
+let listo = true;
+let resto = 10 % 3;
+let n = 1;
+n += 2;
 
 for (let it in items) {
     out it;
 }
+
+while (n < 3) {
+    n = n + 1;
+    break;
+}
+
+if (n > 0) { out n; }
